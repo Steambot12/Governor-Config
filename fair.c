@@ -42,13 +42,10 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_stat_runtime);
  *
  * (BORE default: 24ms constant, units: nanoseconds)
  * (CFS  default: 6ms * (1 + ilog(ncpus)), units: nanoseconds)
- * (Templar 120fps tuning: 10ms = 1.2 frame @120Hz — render thread gets
- *  full frame plus headroom; reduces context-switch storm when many
- *  threads wake on enemy-spawn / asset-stream burst.)
  */
 #ifdef CONFIG_SCHED_BORE
-unsigned int sysctl_sched_latency			= 10000000;
-static unsigned int normalized_sysctl_sched_latency	= 10000000;
+unsigned int sysctl_sched_latency			= 5000000ULL;
+static unsigned int normalized_sysctl_sched_latency	= 5000000ULL;
 #else // CONFIG_SCHED_BORE
  unsigned int sysctl_sched_latency			= 5000000ULL;
  static unsigned int normalized_sysctl_sched_latency	= 5000000ULL;
@@ -78,13 +75,10 @@ enum sched_tunable_scaling sysctl_sched_tunable_scaling = SCHED_TUNABLESCALING_L
  *
  * (BORE default: 3 msec constant, units: nanoseconds)
  * (CFS  default: 0.75 msec * (1 + ilog(ncpus)), units: nanoseconds)
- * (Templar 120fps tuning: 1.5ms — input thread on twitch (FPS shooting)
- *  must not be blocked by render-thread slot. Pairs with vorpal v6.6
- *  TWITCH detection that boosts CPU instantly on sub-frame spikes.)
  */
 #ifdef CONFIG_SCHED_BORE
-unsigned int sysctl_sched_min_granularity			= 1500000;
-static unsigned int normalized_sysctl_sched_min_granularity	= 1500000;
+unsigned int sysctl_sched_min_granularity			= 800000ULL;
+static unsigned int normalized_sysctl_sched_min_granularity	= 800000ULL;
 #else // CONFIG_SCHED_BORE
  unsigned int sysctl_sched_min_granularity			= 750000ULL;
  static unsigned int normalized_sysctl_sched_min_granularity	= 750000ULL;
@@ -100,7 +94,7 @@ static unsigned int sched_nr_latency = 8;
  * After fork, child runs first. If set to 0 (default) then
  * parent will (try to) run first.
  */
-unsigned int sysctl_sched_child_runs_first __read_mostly = 0;
+unsigned int sysctl_sched_child_runs_first __read_mostly = 1;
 
 /*
  * SCHED_OTHER wake-up granularity.
@@ -111,28 +105,49 @@ unsigned int sysctl_sched_child_runs_first __read_mostly = 0;
  *
  * (BORE default: 4 msec constant, units: nanoseconds)
  * (CFS  default: 1 msec * (1 + ilog(ncpus)), units: nanoseconds)
- * (Templar 120fps tuning: 0.8ms — sub-min_granularity wake-bias for
- *  instant render-thread preempt on vsync/input/spawn events.)
  */
 #ifdef CONFIG_SCHED_BORE
-unsigned int sysctl_sched_wakeup_granularity			= 800000;
-static unsigned int normalized_sysctl_sched_wakeup_granularity	= 800000;
+unsigned int sysctl_sched_wakeup_granularity			= 1500000ULL;
+static unsigned int normalized_sysctl_sched_wakeup_granularity	= 1500000ULL;
 #else // CONFIG_SCHED_BORE
 unsigned int sysctl_sched_wakeup_granularity			= 1000000UL;
 static unsigned int normalized_sysctl_sched_wakeup_granularity	= 1000000UL;
 #endif // CONFIG_SCHED_BORE
 
-const_debug unsigned int sysctl_sched_migration_cost	= 2000000;
+const_debug unsigned int sysctl_sched_migration_cost	= 800000UL;
+
+/* PERFORMANCE TUNING BEGIN — gaming-aware preemption granularity
+ *
+ * Set by the active cpufreq governor (e.g. via a gaming_mode sysfs node).
+ * When non-zero, CFS widens its slice and wakeup granularity (see
+ * __sched_period() and wakeup_gran()) so render/critical threads keep the CPU
+ * longer and suffer fewer wakeup-preemptions — the main cause of frame-pacing
+ * jitter. Plain global, accessed with READ_ONCE/WRITE_ONCE; no
+ * task_struct/sched_entity layout change, so KMI/ABI-safe on GKI 5.10.
+ */
+unsigned int __read_mostly sched_gaming_active;
+EXPORT_SYMBOL_GPL(sched_gaming_active);
+
+/* Extra granularity granted in gaming mode: +75% (val + val/2 + val/4).
+ * Wider non-preemptive slice so a running compositor/render thread completes a
+ * frame cycle without being clipped by ambient background tasks. */
+static __always_inline u64 sched_gaming_stretch(u64 val)
+{
+	if (READ_ONCE(sched_gaming_active))
+		return val + (val >> 1) + (val >> 2);
+	return val;
+}
+/* PERFORMANCE TUNING END */
 
 #ifdef CONFIG_SCHED_BORE
 u8   __read_mostly sched_bore                   = 1;
 u8   __read_mostly sched_burst_exclude_kthreads = 1;
-u8   __read_mostly sched_burst_smoothness_long  = 5;
-u8   __read_mostly sched_burst_smoothness_short = 0;
+u8   __read_mostly sched_burst_smoothness_long  = 2;
+u8   __read_mostly sched_burst_smoothness_short = 1;
 u8   __read_mostly sched_burst_fork_atavistic   = 0;
-u8   __read_mostly sched_burst_penalty_offset   = 35;
-uint __read_mostly sched_burst_penalty_scale    = 192;
-uint __read_mostly sched_burst_cache_lifetime   = 240000000;
+u8   __read_mostly sched_burst_penalty_offset   = 24;
+uint __read_mostly sched_burst_penalty_scale    = 550;
+uint __read_mostly sched_burst_cache_lifetime   = 12000000;
 #endif // CONFIG_SCHED_BORE
 
 int sched_thermal_decay_shift = 4;
@@ -568,11 +583,11 @@ static inline u32 log2plus1_u64_u32f8(u64 v) {
 
 static inline u32 calc_burst_penalty(u64 burst_time) {
 	u32 greed, tolerance, penalty, scaled_penalty;
-
+	
 	greed = log2plus1_u64_u32f8(burst_time);
 	tolerance = sched_burst_penalty_offset << 8;
-	penalty = (greed > tolerance) ? (greed - tolerance) : 0;
-	scaled_penalty = (u32)(((u64)penalty * sched_burst_penalty_scale) >> 16);
+	penalty = max(0, (s32)(greed - tolerance));
+	scaled_penalty = penalty * sched_burst_penalty_scale >> 16;
 
 	return min(MAX_BURST_PENALTY, scaled_penalty);
 }
@@ -625,10 +640,10 @@ static void update_burst_penalty(struct sched_entity *se) {
 }
 
 static inline u32 binary_smooth(u32 new, u32 old) {
-	int increment = (int)new - (int)old;
-	if (increment >= 0)
-		return old + (increment >> (int)sched_burst_smoothness_long);
-	return old - (-increment >> (int)sched_burst_smoothness_short);
+	int increment = new - old;
+		return (0 <= increment)?
+	old + ( increment >> (int)sched_burst_smoothness_long):
+	old - (-increment >> (int)sched_burst_smoothness_short);
 }
 
 static void restart_burst(struct sched_entity *se) {
@@ -847,10 +862,12 @@ static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
  */
 static u64 __sched_period(unsigned long nr_running)
 {
+	/* PERFORMANCE TUNING BEGIN — stretch the CFS period in gaming mode */
 	if (unlikely(nr_running > sched_nr_latency))
-		return nr_running * sysctl_sched_min_granularity;
+		return sched_gaming_stretch(nr_running * sysctl_sched_min_granularity);
 	else
-		return sysctl_sched_latency;
+		return sched_gaming_stretch(sysctl_sched_latency);
+	/* PERFORMANCE TUNING END */
 }
 
 /*
@@ -7340,7 +7357,12 @@ balance_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 
 static unsigned long wakeup_gran(struct sched_entity *se)
 {
+	/* PERFORMANCE TUNING BEGIN — split-stretch: the slice expansion lives in
+	 * __sched_period() (protects a running compositor mid-frame), but wakeup
+	 * granularity is deliberately NOT stretched so latency-critical game
+	 * wakeups (firing input, scope open, movement) preempt instantly. */
 	unsigned long gran = sysctl_sched_wakeup_granularity;
+	/* PERFORMANCE TUNING END */
 
 	/*
 	 * Since its curr running now, convert the gran from real-time
@@ -8183,7 +8205,7 @@ static struct task_struct *detach_one_task(struct lb_env *env)
 	return NULL;
 }
 
-static const unsigned int sched_nr_migrate_break = 16;
+static const unsigned int sched_nr_migrate_break = 32;
 
 /*
  * detach_tasks() -- tries to detach up to imbalance load/util/tasks from
