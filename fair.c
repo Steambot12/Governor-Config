@@ -128,13 +128,14 @@ const_debug unsigned int sysctl_sched_migration_cost	= 800000UL;
 unsigned int __read_mostly sched_gaming_active;
 EXPORT_SYMBOL_GPL(sched_gaming_active);
 
-/* Extra granularity granted in gaming mode: +75% (val + val/2 + val/4).
- * Wider non-preemptive slice so a running compositor/render thread completes a
- * frame cycle without being clipped by ambient background tasks. */
+/* Extra granularity granted in gaming mode: +60% (val * 8 / 5). Applied
+ * uniformly to BOTH the execution slice (__sched_period) and wakeup granularity
+ * (wakeup_gran): protects a running compositor mid-frame AND gives a balanced,
+ * non-thrashing window for latency-critical wakeups. */
 static __always_inline u64 sched_gaming_stretch(u64 val)
 {
 	if (READ_ONCE(sched_gaming_active))
-		return val + (val >> 1) + (val >> 2);
+		return (val * 8) / 5;
 	return val;
 }
 /* PERFORMANCE TUNING END */
@@ -7357,11 +7358,9 @@ balance_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 
 static unsigned long wakeup_gran(struct sched_entity *se)
 {
-	/* PERFORMANCE TUNING BEGIN — split-stretch: the slice expansion lives in
-	 * __sched_period() (protects a running compositor mid-frame), but wakeup
-	 * granularity is deliberately NOT stretched so latency-critical game
-	 * wakeups (firing input, scope open, movement) preempt instantly. */
-	unsigned long gran = sysctl_sched_wakeup_granularity;
+	/* PERFORMANCE TUNING BEGIN — re-unified +60% stretch on wakeup granularity
+	 * (matched to __sched_period) for a single synchronized gaming window. */
+	unsigned long gran = sched_gaming_stretch(sysctl_sched_wakeup_granularity);
 	/* PERFORMANCE TUNING END */
 
 	/*
