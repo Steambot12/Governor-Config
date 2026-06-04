@@ -84,30 +84,21 @@ extern unsigned int sched_gaming_active;
 #define RFX_TEMP_CAP_FLOOR_PCT  85
 #define RFX_THERMAL_POLL_MS     250
 #define RFX_THERMAL_POLL_SLOW_MS 1000
-#define RFX_EMA_GAME_ALPHA_UP    20     /* gaming: filter momentary spikes   */
-#define RFX_EMA_GAME_ALPHA_DOWN  2      /* gaming: lazy decay, no premature drop */
+#define RFX_EMA_GAME_ALPHA_UP    22     /* gaming: suppress rapid load-hunting spikes */
+#define RFX_EMA_GAME_ALPHA_DOWN  3      /* gaming: lazy, stabilized downward decay    */
 #define RFX_EMA_DAILY_ALPHA_UP   15
 #define RFX_EMA_DAILY_ALPHA_DOWN 2
 #define RFX_EMA_SCALE            32
 
-/* Load-adaptive frequency hysteresis hold (gaming): once the clock steps UP, it
- * is held against shallow ramp-downs to flatten the "sharktooth" oscillation of
- * heavy asset-streaming titles. The hold strength is now LOAD-AWARE so it does
- * not over-hold during lighter workloads (which would bloat CPU% and power):
- *
- *   filtered load >  RFX_HOLD_LOAD_THRESHOLD_PCT (heavy combat / map load):
- *       long hold (HIGH_NS) + wide dead-band (HIGH_SHIFT, ~25%) -> no yoyo
- *   filtered load <= threshold (standard gameplay loop):
- *       short hold (LOW_NS) + narrow dead-band (LOW_SHIFT, ~12.5%) -> natural
- *       decay, lower power, no over-hold stagnation
- *
- * The dead-band is a right-shift of the current freq (deep = freq >> shift):
- * only a drop deeper than that passes early; shallow dips are held. */
-#define RFX_HOLD_LOAD_THRESHOLD_PCT 65
-#define RFX_HOLD_HIGH_NS            (90 * NSEC_PER_MSEC)
-#define RFX_HOLD_HIGH_SHIFT         2      /* ~25% dead-band, heavy load   */
-#define RFX_HOLD_LOW_NS             (40 * NSEC_PER_MSEC)
-#define RFX_HOLD_LOW_SHIFT          3      /* ~12.5% dead-band, light load */
+/* Unified static frequency hysteresis hold (gaming). Once the clock steps UP it
+ * is held against shallow ramp-downs for ONE fixed window before any downward
+ * ramp — a single static matrix for every title (no load-tier switching, which
+ * thrashed). Wide enough to absorb heavy asset streaming, tight enough to avoid
+ * over-holding light loops. A deep drop (load collapse, e.g. match -> lobby)
+ * still passes immediately via the dead-band, so the clock never stagnates into
+ * idle. Thermal throttle bypasses the hold entirely (safety wins). */
+#define RFX_GAMING_HOLD_NS         (75 * NSEC_PER_MSEC)
+#define RFX_GAMING_HOLD_DROP_SHIFT 2      /* deep-drop escape: freq >> 2 = 25% */
 #define RFX_DEFAULT_THERMAL_ZONE  "quiet_therm"
 #define RFX_FALLBACK_THERMAL_ZONE "battery"
 #define RFX_TEMP_WATCH_MC          39000
@@ -857,8 +848,7 @@ static bool rfx_should_update_freq(struct rfx_policy *rfx_pol, u64 time)
 }
 
 static bool rfx_update_next_freq(struct rfx_policy *rfx_pol, u64 time,
-                 unsigned int next_freq, bool force_down,
-                 unsigned int load_pct)
+                 unsigned int next_freq, bool force_down)
 {
     if (!rfx_pol)
         return false;
@@ -887,23 +877,20 @@ static bool rfx_update_next_freq(struct rfx_policy *rfx_pol, u64 time,
                 else
                     effective_down_delay = 35000 * NSEC_PER_USEC;
 
-                /* PERFORMANCE TUNING BEGIN — load-adaptive hysteresis hold.
-                 * Within the hold window after a step-up, reject shallow
-                 * ramp-downs (the sharktooth pattern); only a deep drop passes
-                 * early. The hold window and dead-band scale with the filtered
-                 * load: heavy workloads hold long and wide (no yoyo), lighter
-                 * gameplay holds short and narrow (natural decay, lower power,
-                 * no over-hold bloat). Thermal throttle bypasses this entirely. */
+                /* PERFORMANCE TUNING BEGIN — unified static hysteresis hold.
+                 * Within a single fixed window after a step-up, reject shallow
+                 * ramp-downs (the sharktooth pattern); only a deep drop (>=25%,
+                 * i.e. a real load collapse such as match -> lobby) passes early
+                 * so the clock never over-holds into idle. One static matrix for
+                 * all titles — no load-tier switching. Thermal throttle bypasses
+                 * this entirely so safety always wins. */
                 if (!rfx_pol->thermal_throttle_active) {
                     s64 up_held = time - rfx_pol->last_upfreq_time;
                     unsigned int drop = rfx_pol->next_freq - next_freq;
-                    bool heavy = (load_pct > RFX_HOLD_LOAD_THRESHOLD_PCT);
-                    u64 hold_ns = heavy ? RFX_HOLD_HIGH_NS : RFX_HOLD_LOW_NS;
-                    unsigned int shift = heavy ? RFX_HOLD_HIGH_SHIFT
-                                               : RFX_HOLD_LOW_SHIFT;
-                    unsigned int deep = rfx_pol->next_freq >> shift;
+                    unsigned int deep =
+                        rfx_pol->next_freq >> RFX_GAMING_HOLD_DROP_SHIFT;
 
-                    if ((u64)up_held < hold_ns && drop < deep)
+                    if ((u64)up_held < RFX_GAMING_HOLD_NS && drop < deep)
                         return false;
                 }
                 /* PERFORMANCE TUNING END */
@@ -1772,8 +1759,7 @@ static void rfx_update_single_freq(struct update_util_data *hook, u64 time,
         rfx_pol->render_boost_end_ns = 0;
     }
 
-    rfx_update_next_freq(rfx_pol, time, next_f, force_down,
-                         rfx_c->filtered_busy_pct);
+    rfx_update_next_freq(rfx_pol, time, next_f, force_down);
 
     if (rfx_pol->policy->fast_switch_enabled)
         cpufreq_driver_fast_switch(rfx_pol->policy, rfx_pol->next_freq);
@@ -1924,8 +1910,7 @@ static void rfx_update_shared(struct update_util_data *hook, u64 time,
 
     if (rfx_should_update_freq(rfx_pol, time)) {
         next_f = rfx_next_freq_shared(rfx_c, time, &force_down);
-        rfx_update_next_freq(rfx_pol, time, next_f, force_down,
-                             rfx_c->filtered_busy_pct);
+        rfx_update_next_freq(rfx_pol, time, next_f, force_down);
 
         if (rfx_pol->policy->fast_switch_enabled)
             cpufreq_driver_fast_switch(rfx_pol->policy, rfx_pol->next_freq);
