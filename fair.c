@@ -7987,13 +7987,20 @@ static int task_hot(struct task_struct *p, struct lb_env *env)
 	delta = rq_clock_task(env->src_rq) - p->se.exec_start;
 
 	/*
-	 * Gaming bias: widen the cache-hot window so a recently-run task stays
-	 * on its current CPU longer, reducing migration-induced load spikes.
-	 * Only stickiness is affected; the balancer can still move a task once
-	 * it is genuinely cold, so fairness/throughput are preserved.
+	 * Gaming task isolation + anti-thrash. A heavy thread (render / game
+	 * logic using a meaningful slice of its current CPU) is kept off a
+	 * smaller-capacity destination - demoting it to a LITTLE core is a common
+	 * frame-drop source. Light tasks stay migratable so the balancer can pack
+	 * them onto LITTLE as usual. Recently-run tasks also get a widened
+	 * cache-hot window to cut lobby migration churn. This is a bias, not a
+	 * hard pin (active balance can still move it), and reads only - KMI-safe.
 	 */
-	if (sched_gaming_active)
+	if (sched_gaming_active) {
+		if (capacity_orig_of(env->dst_cpu) < capacity_orig_of(env->src_cpu) &&
+		    task_util(p) > (capacity_orig_of(env->src_cpu) >> 2))
+			return 1;
 		return delta < (s64)sysctl_sched_migration_cost * 2;
+	}
 
 	return delta < (s64)sysctl_sched_migration_cost;
 }
