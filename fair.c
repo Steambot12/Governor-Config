@@ -24,6 +24,7 @@
  *  Copyright (C) 2021-2024 Masahito Suzuki <firelzrd@gmail.com>
  */
 #include "sched.h"
+#include <linux/prefer_silver.h>
 
 #include <trace/hooks/sched.h>
 
@@ -116,40 +117,26 @@ static unsigned int normalized_sysctl_sched_wakeup_granularity	= 1000000UL;
 
 const_debug unsigned int sysctl_sched_migration_cost	= 800000UL;
 
-/* PERFORMANCE TUNING BEGIN — gaming-aware preemption granularity
- *
- * Set by the active cpufreq governor (e.g. via a gaming_mode sysfs node).
- * When non-zero, CFS widens its slice and wakeup granularity (see
- * __sched_period() and wakeup_gran()) so render/critical threads keep the CPU
- * longer and suffer fewer wakeup-preemptions — the main cause of frame-pacing
- * jitter. Plain global, accessed with READ_ONCE/WRITE_ONCE; no
- * task_struct/sched_entity layout change, so KMI/ABI-safe on GKI 5.10.
- */
-unsigned int __read_mostly sched_gaming_active;
-EXPORT_SYMBOL_GPL(sched_gaming_active);
-
-/* Extra granularity granted in gaming mode: +60% (val * 8 / 5). Applied
- * uniformly to BOTH the execution slice (__sched_period) and wakeup granularity
- * (wakeup_gran): protects a running compositor mid-frame AND gives a balanced,
- * non-thrashing window for latency-critical wakeups. */
-static __always_inline u64 sched_gaming_stretch(u64 val)
-{
-	if (READ_ONCE(sched_gaming_active))
-		return (val * 8) / 5;
-	return val;
-}
-/* PERFORMANCE TUNING END */
-
 #ifdef CONFIG_SCHED_BORE
 u8   __read_mostly sched_bore                   = 1;
 u8   __read_mostly sched_burst_exclude_kthreads = 1;
 u8   __read_mostly sched_burst_smoothness_long  = 2;
 u8   __read_mostly sched_burst_smoothness_short = 1;
 u8   __read_mostly sched_burst_fork_atavistic   = 0;
-u8   __read_mostly sched_burst_penalty_offset   = 24;
+u8   __read_mostly sched_burst_penalty_offset   = 22;
 uint __read_mostly sched_burst_penalty_scale    = 550;
 uint __read_mostly sched_burst_cache_lifetime   = 12000000;
 #endif // CONFIG_SCHED_BORE
+
+/*
+ * Vorpal gaming coupling. File-scope global (KMI-safe: not a task_struct /
+ * sched_entity field) written by the Vorpal governor's gaming_mode knob and
+ * read in task_hot() to bias the load balancer toward cache stickiness during
+ * sustained gaming, cutting churny cross-core migrations that surface as
+ * mid-frame load spikes. 0 == normal CFS behaviour.
+ */
+int __read_mostly sched_gaming_active;
+EXPORT_SYMBOL_GPL(sched_gaming_active);
 
 int sched_thermal_decay_shift = 4;
 static int __init setup_sched_thermal_decay_shift(char *str)
@@ -863,12 +850,10 @@ static inline u64 calc_delta_fair(u64 delta, struct sched_entity *se)
  */
 static u64 __sched_period(unsigned long nr_running)
 {
-	/* PERFORMANCE TUNING BEGIN — stretch the CFS period in gaming mode */
 	if (unlikely(nr_running > sched_nr_latency))
-		return sched_gaming_stretch(nr_running * sysctl_sched_min_granularity);
+		return nr_running * sysctl_sched_min_granularity;
 	else
-		return sched_gaming_stretch(sysctl_sched_latency);
-	/* PERFORMANCE TUNING END */
+		return sysctl_sched_latency;
 }
 
 /*
@@ -7277,6 +7262,13 @@ select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_f
 	}
 	rcu_read_unlock();
 
+#ifdef CONFIG_SCHED_PREFER_SILVER
+	if (prefer_silver_check_task_util(p)) {
+		int silver_cpu = find_best_silver_cpu(p);
+		if (silver_cpu >= 0)
+			return silver_cpu;
+	}
+#endif /* CONFIG_SCHED_PREFER_SILVER */
 	return new_cpu;
 }
 
@@ -7358,10 +7350,7 @@ balance_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 
 static unsigned long wakeup_gran(struct sched_entity *se)
 {
-	/* PERFORMANCE TUNING BEGIN — re-unified +60% stretch on wakeup granularity
-	 * (matched to __sched_period) for a single synchronized gaming window. */
-	unsigned long gran = sched_gaming_stretch(sysctl_sched_wakeup_granularity);
-	/* PERFORMANCE TUNING END */
+	unsigned long gran = sysctl_sched_wakeup_granularity;
 
 	/*
 	 * Since its curr running now, convert the gran from real-time
@@ -7996,6 +7985,15 @@ static int task_hot(struct task_struct *p, struct lb_env *env)
 		return 0;
 
 	delta = rq_clock_task(env->src_rq) - p->se.exec_start;
+
+	/*
+	 * Gaming bias: widen the cache-hot window so a recently-run task stays
+	 * on its current CPU longer, reducing migration-induced load spikes.
+	 * Only stickiness is affected; the balancer can still move a task once
+	 * it is genuinely cold, so fairness/throughput are preserved.
+	 */
+	if (sched_gaming_active)
+		return delta < (s64)sysctl_sched_migration_cost * 2;
 
 	return delta < (s64)sysctl_sched_migration_cost;
 }
