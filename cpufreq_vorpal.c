@@ -81,23 +81,39 @@ extern int sched_gaming_active;
 /* Gaming-mode per-cluster floors / caps, as percent of policy f_max.
  * Floors keep render/sim threads off the wall; caps leave thermal headroom
  * (caps are deliberately < 100 so we sustain rather than spike-and-throttle). */
-#define RFX_GAMING_FLOOR_PRIME_PCT	82
+#define RFX_GAMING_FLOOR_PRIME_PCT	88
 #define RFX_GAMING_FLOOR_BIG_PCT	78
-#define RFX_GAMING_CAP_PRIME_PCT	92
+#define RFX_GAMING_CAP_PRIME_PCT	99
 #define RFX_GAMING_CAP_BIG_PCT		94
+#define RFX_GAMING_FLOOR_LITTLE_PCT	45
 #define RFX_GAMING_LITTLE_CAP_PCT	85
 #define RFX_GAMING_HEADROOM_PCT		28
 #define RFX_GAMING_LOCK_NS		(800  * NSEC_PER_MSEC)
 #define RFX_GAMING_HYSTERESIS_NS	(6000 * NSEC_PER_MSEC)
 
-/* Predictive thermal step-down: if the cluster sits above HIGH_PCT of f_max
- * for SETTLE_NS continuously we pull the cap to SOFT_PCT for THROTTLE_NS, so
- * the drop is gradual (no visible jitter) instead of a hard trip later. This
- * is internal pacing; the *measured* temperature ceiling arrives separately
- * via rfx_thermal_cap_pct (slow-path, never read in the fast path). */
-#define RFX_THERMAL_HIGH_PCT		85
+/* Gaming spike rejection. A lobby/waiting-room asset load is a short burst that
+ * rockets util to 80%+ for a few ticks without any sustained 120fps render
+ * demand behind it. We only treat a high load as "real heavy" once it persists
+ * for SPIKE_CONFIRM consecutive updates; until then the burst is held to a
+ * comfort cap so it cannot wake every core to f_max. Frame-pacing (userspace
+ * frame_time feed) is exempt - a genuine 120fps frame overrun bypasses this. */
+#define RFX_GAMING_HEAVY_ENTER_PCT	60
+#define RFX_GAMING_SPIKE_CONFIRM	4
+#define RFX_GAMING_BURST_CAP_PCT	60
+
+/* Predictive thermal step-down (frequency-based, governor-internal).
+ *
+ * NOTE: this heuristic throttles purely on *frequency residency*, not measured
+ * temperature. On a Prime core that legitimately sustains ~96% of f_max during
+ * heavy gameplay it tripped every SETTLE_NS, producing the periodic micro-drops
+ * (~96% -> SOFT_CAP) that read as recurring sub-100fps dips. The real thermal
+ * ceiling is the *measured* cap published via rfx_thermal_cap_pct (fed by the
+ * thermal framework / userspace daemon) and is left fully intact. HIGH_PCT is
+ * therefore set to 100 so the freq-only path never self-throttles a healthy
+ * sustained clock; if it ever does trip, SOFT_CAP keeps the step shallow. */
+#define RFX_THERMAL_HIGH_PCT		100
 #define RFX_THERMAL_LOW_PCT		70
-#define RFX_THERMAL_SOFT_CAP_PCT	90
+#define RFX_THERMAL_SOFT_CAP_PCT	96
 #define RFX_THERMAL_SETTLE_NS		(4000 * NSEC_PER_MSEC)
 #define RFX_THERMAL_THROTTLE_NS		(4000 * NSEC_PER_MSEC)
 
@@ -217,6 +233,10 @@ struct rfx_policy {
 
 	/* EMA. */
 	unsigned int ema_util_pct;
+
+	/* Gaming spike rejection (lobby asset-load bursts). */
+	unsigned int spike_confirm;
+	bool burst_capped;
 };
 
 static DEFINE_PER_CPU(struct rfx_cpu, rfx_cpu_table);
@@ -422,11 +442,43 @@ static unsigned long rfx_iowait_apply(struct rfx_cpu *rfx_c, u64 time, unsigned 
 
 /* ===================== Heavy/gaming state ===================== */
 
-static void rfx_update_heavy(struct rfx_policy *rfx_pol, unsigned int util_pct, u64 time)
+static inline bool rfx_frame_active(struct rfx_policy *rfx_pol, u64 time)
+{
+	return rfx_pol->frame_boost_end_ns && time < rfx_pol->frame_boost_end_ns;
+}
+
+/* Returns true once a high load has persisted long enough to be a real render
+ * load rather than a transient lobby burst. Also publishes burst_capped, which
+ * tells rfx_calc_freq to hold an unconfirmed burst to a comfort cap. A genuine
+ * frame overrun (userspace frame-pacing feed) is always treated as confirmed. */
+static bool rfx_spike_confirmed(struct rfx_policy *rfx_pol, unsigned int util_pct, u64 time)
+{
+	if (rfx_frame_active(rfx_pol, time)) {
+		rfx_pol->spike_confirm = RFX_GAMING_SPIKE_CONFIRM;
+		rfx_pol->burst_capped = false;
+		return true;
+	}
+
+	if (util_pct >= RFX_GAMING_HEAVY_ENTER_PCT) {
+		if (rfx_pol->spike_confirm < RFX_GAMING_SPIKE_CONFIRM)
+			rfx_pol->spike_confirm++;
+	} else if (util_pct < RFX_GAMING_BURST_CAP_PCT) {
+		rfx_pol->spike_confirm = 0;
+	}
+
+	rfx_pol->burst_capped = (util_pct >= RFX_GAMING_HEAVY_ENTER_PCT) &&
+				(rfx_pol->spike_confirm < RFX_GAMING_SPIKE_CONFIRM);
+	return rfx_pol->spike_confirm >= RFX_GAMING_SPIKE_CONFIRM;
+}
+
+static void rfx_update_heavy(struct rfx_policy *rfx_pol, bool confirmed, u64 time)
 {
 	if (rfx_gaming()) {
 		rfx_pol->in_deep_idle = false;
-		if (util_pct >= 5) {
+		/* Only a CONFIRMED sustained load (or active frame pacing) latches
+		 * heavy mode + cluster floors. Unconfirmed lobby bursts do not, so
+		 * they never wake every core to f_max. */
+		if (confirmed) {
 			rfx_pol->in_heavy_mode = true;
 			rfx_pol->gaming_lock_end_ns = time + RFX_GAMING_LOCK_NS;
 		} else if (rfx_pol->gaming_lock_end_ns && time < rfx_pol->gaming_lock_end_ns) {
@@ -503,6 +555,12 @@ static unsigned int rfx_calc_freq(struct rfx_policy *rfx_pol, unsigned long util
 				freq = max(freq, rfx_floor_of_max(policy, RFX_GAMING_FLOOR_BIG_PCT));
 			freq = min(freq, rfx_pct_of_max(policy, RFX_GAMING_CAP_BIG_PCT));
 		} else {
+			/* Hold a mid floor while heavy so the LITTLE cluster stops
+			 * free-falling to ~10% and then snapping back up - that
+			 * 10%<->85% oscillation is a major jank source. Floor < cap
+			 * still leaves room to idle down between bursts. */
+			if (is_heavy)
+				freq = max(freq, rfx_floor_of_max(policy, RFX_GAMING_FLOOR_LITTLE_PCT));
 			freq = min(freq, rfx_pct_of_max(policy, RFX_GAMING_LITTLE_CAP_PCT));
 		}
 
@@ -662,12 +720,22 @@ static unsigned int rfx_decide(struct rfx_cpu *lead, u64 time, unsigned long poo
 	unsigned long max_cap = arch_scale_cpu_capacity(lead->cpu);
 	unsigned int ema_pct, eff_pct, next_f;
 	unsigned long effective;
-	bool is_heavy;
+	bool is_heavy, confirmed = true;
 
 	ema_pct = rfx_ema_filter(rfx_pol, util_pct);
 	eff_pct = max(ema_pct, util_pct);		/* never below the raw demand */
+
+	/* Gaming: hold an unconfirmed high-load burst (lobby asset load) to a
+	 * comfort cap so it cannot ramp the cluster to f_max. EMA itself is
+	 * untouched - this only bounds the value handed to freq selection. */
+	if (rfx_gaming()) {
+		confirmed = rfx_spike_confirmed(rfx_pol, util_pct, time);
+		if (rfx_pol->burst_capped)
+			eff_pct = min(eff_pct, (unsigned int)RFX_GAMING_BURST_CAP_PCT);
+	}
+
 	effective = max_cap * eff_pct / 100;
-	if (effective < pooled_util)
+	if (effective < pooled_util && !rfx_pol->burst_capped)
 		effective = pooled_util;		/* never below PELT+iowait */
 
 	/* Idle detection (daily only): confirm with the NOHZ idle-call counter
@@ -688,7 +756,7 @@ static unsigned int rfx_decide(struct rfx_cpu *lead, u64 time, unsigned long poo
 		rfx_pol->last_real_update_ns = time;
 	}
 
-	rfx_update_heavy(rfx_pol, util_pct, time);
+	rfx_update_heavy(rfx_pol, confirmed, time);
 	rfx_frame_observe(rfx_pol, time);
 
 	if (!rfx_gaming() && util_pct >= 1) {
@@ -945,6 +1013,8 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set, const char *buf,
 			pol->thermal_high_start_ns = 0;
 			pol->sustain_hold_end_ns = 0;
 			pol->in_heavy_mode = false;
+			pol->spike_confirm = 0;
+			pol->burst_capped = false;
 			pol->need_freq_update = true;
 		}
 	}
@@ -1286,6 +1356,8 @@ static int rfx_start(struct cpufreq_policy *policy)
 	rfx_pol->last_real_update_ns = now;
 	rfx_pol->in_heavy_mode = false;
 	rfx_pol->ema_util_pct = 0;
+	rfx_pol->spike_confirm = 0;
+	rfx_pol->burst_capped = false;
 
 	uu = policy_is_shared(policy) ? rfx_update_shared : rfx_update_single;
 
