@@ -49,6 +49,7 @@
 #include <linux/tick.h>
 #include <linux/jiffies.h>
 #include <linux/irq_work.h>
+#include <linux/input.h>
 
 /* Owned + EXPORT_SYMBOL_GPL'd in kernel/sched/cpufreq_schedutil.c. */
 extern void rfx_get_util_gki510(int cpu, unsigned long boost,
@@ -81,41 +82,39 @@ extern int sched_gaming_active;
 /* Gaming-mode per-cluster floors / caps, as percent of policy f_max.
  * Floors keep render/sim threads off the wall; caps leave thermal headroom
  * (caps are deliberately < 100 so we sustain rather than spike-and-throttle). */
-#define RFX_GAMING_FLOOR_PRIME_PCT	88
-#define RFX_GAMING_FLOOR_BIG_PCT	78
+/* gaming_mode=1 preset, absolute kHz (SoC-specific, clamped to policy range):
+ * Prime floor ~2.2GHz (max ~2.9), Big floor ~1.8GHz (max ~2.4), Little held in a
+ * tight efficient 1.0-1.2GHz band so it stops ramping to 1.5-1.8GHz. */
+#define RFX_GAMING_FLOOR_PRIME_KHZ	2200000
+#define RFX_GAMING_FLOOR_BIG_KHZ	1800000
 #define RFX_GAMING_CAP_PRIME_PCT	99
 #define RFX_GAMING_CAP_BIG_PCT		94
-#define RFX_GAMING_FLOOR_LITTLE_PCT	45
-#define RFX_GAMING_LITTLE_CAP_PCT	85
+#define RFX_GAMING_FLOOR_LITTLE_KHZ	1000000
+#define RFX_GAMING_CAP_LITTLE_KHZ	1200000
 #define RFX_GAMING_HEADROOM_PCT		28
 #define RFX_GAMING_LOCK_NS		(800  * NSEC_PER_MSEC)
 #define RFX_GAMING_HYSTERESIS_NS	(6000 * NSEC_PER_MSEC)
 
-/* Gaming spike rejection. A lobby/waiting-room asset load is a short burst that
- * rockets util to 80%+ for a few ticks without any sustained 120fps render
- * demand behind it. We only treat a high load as "real heavy" once it persists
- * for SPIKE_CONFIRM consecutive updates; until then the burst is held to a
- * comfort cap so it cannot wake every core to f_max. Frame-pacing (userspace
- * frame_time feed) is exempt - a genuine 120fps frame overrun bypasses this. */
+/* Gaming heavy-latch confirmation. A lobby/waiting-room asset load is a short
+ * blip; the sustained cluster floors only latch once load stays >= ENTER_PCT
+ * for SPIKE_CONFIRM consecutive updates (a brief dip decrements rather than
+ * resets the count, so fluctuating gameplay stays latched - no flapping). This
+ * gates ONLY the floor latch; frequency always tracks demand, so a real scene
+ * is never starved. A live frame-pacing feed forces a latch. */
 #define RFX_GAMING_HEAVY_ENTER_PCT	60
 #define RFX_GAMING_SPIKE_CONFIRM	4
-#define RFX_GAMING_BURST_CAP_PCT	60
 
-/* Predictive thermal step-down (frequency-based, governor-internal).
- *
- * NOTE: this heuristic throttles purely on *frequency residency*, not measured
- * temperature. On a Prime core that legitimately sustains ~96% of f_max during
- * heavy gameplay it tripped every SETTLE_NS, producing the periodic micro-drops
- * (~96% -> SOFT_CAP) that read as recurring sub-100fps dips. The real thermal
- * ceiling is the *measured* cap published via rfx_thermal_cap_pct (fed by the
- * thermal framework / userspace daemon) and is left fully intact. HIGH_PCT is
- * therefore set to 100 so the freq-only path never self-throttles a healthy
- * sustained clock; if it ever does trip, SOFT_CAP keeps the step shallow. */
-#define RFX_THERMAL_HIGH_PCT		100
-#define RFX_THERMAL_LOW_PCT		70
-#define RFX_THERMAL_SOFT_CAP_PCT	96
-#define RFX_THERMAL_SETTLE_NS		(4000 * NSEC_PER_MSEC)
-#define RFX_THERMAL_THROTTLE_NS		(4000 * NSEC_PER_MSEC)
+/* Thermal slope control. The measured ceiling % (from the real temperature
+ * trip) is published into rfx_thermal_cap_pct by the thermal framework/daemon -
+ * the governor never reads a sensor in the fast path. Instead of snapping the
+ * applied cap to the published value (a hard step that reads as a "thermal
+ * panic" FPS crash), walk it toward the target one small step per STEP_NS:
+ * down DOWN_PCT, up UP_PCT. This is the governor-side gradual slope; the actual
+ * trip curve still belongs to the thermal zone / cooling governor (use IPA /
+ * POWER_ALLOCATOR there for a true PID slope - step_wise throttles in jumps). */
+#define RFX_THERMAL_STEP_DOWN_PCT	2
+#define RFX_THERMAL_STEP_UP_PCT		1
+#define RFX_THERMAL_STEP_NS		(6 * NSEC_PER_MSEC)
 
 /* Frame pacing. Budget defaults to a 120 fps frame (8333 us). When userspace
  * reports a frame time past BUDGET * MISS_NUM/MISS_DEN we raise the cluster
@@ -127,8 +126,14 @@ extern int sched_gaming_active;
 #define RFX_FRAME_FLOOR_PRIME_PCT	90
 #define RFX_FRAME_FLOOR_BIG_PCT		85
 
-/* Input boost (userspace pulses this on touch). */
-#define RFX_INPUT_BOOST_FREQ_PCT	95
+/* Interaction burst boost (gaming_mode=0). The governor's own input handler
+ * stamps rfx_input_ts_ns on a touch/key event; for WINDOW_NS after that the
+ * Little and Big clusters hold a floor so a UI swipe ramps instantly (120Hz
+ * scroll) without the vendor cpu-input-boost driver. Prime is left out - UI
+ * never needs it - and the floor simply expires (rapid decay to idle). */
+#define RFX_INTERACT_WINDOW_NS		(90 * NSEC_PER_MSEC)
+#define RFX_INTERACT_LITTLE_KHZ		1200000
+#define RFX_INTERACT_BIG_KHZ		1500000
 
 /* Idle / deep-idle parking (daily mode). */
 #define RFX_IDLE_STALE_NS		(30 * NSEC_PER_MSEC)
@@ -167,8 +172,6 @@ struct rfx_tunables {
 	unsigned int rate_limit_us;
 	unsigned int up_rate_limit_us;
 	unsigned int down_rate_limit_us;
-	unsigned int input_boost_ms;
-	unsigned int input_boost_pct;
 	enum rfx_cluster_type cluster_type;
 };
 
@@ -213,16 +216,13 @@ struct rfx_policy {
 
 	/* Boost / hold windows (ns deadlines). */
 	u64 gaming_lock_end_ns;
-	u64 input_boost_end_ns;
-	unsigned int input_boost_freq;
 	u64 frame_boost_end_ns;
 	u64 sustain_hold_end_ns;
 	u64 interactive_end_ns;
 
-	/* Predictive thermal step-down. */
-	u64 thermal_high_start_ns;
-	u64 thermal_throttle_end_ns;
-	bool thermal_throttle_active;
+	/* Thermal slope (smoothed cap %, ramps toward rfx_thermal_cap_pct). */
+	unsigned int thermal_cap_smoothed;
+	u64 thermal_step_ns;
 
 	/* Idle. */
 	bool in_deep_idle;
@@ -234,9 +234,8 @@ struct rfx_policy {
 	/* EMA. */
 	unsigned int ema_util_pct;
 
-	/* Gaming spike rejection (lobby asset-load bursts). */
+	/* Gaming heavy-latch confirmation counter. */
 	unsigned int spike_confirm;
-	bool burst_capped;
 };
 
 static DEFINE_PER_CPU(struct rfx_cpu, rfx_cpu_table);
@@ -260,6 +259,11 @@ static atomic_t rfx_thermal_cap_pct = ATOMIC_INIT(100);
 /* Frame pacing, fed by userspace. */
 static atomic_t rfx_frame_time_us  = ATOMIC_INIT(0);
 static atomic_t rfx_frame_budget_us = ATOMIC_INIT(RFX_FRAME_BUDGET_US_DEFAULT);
+
+/* Timestamp (ns) of the last touch/key input event, published by the governor's
+ * input handler and read lock-free in the fast path to drive the daily-mode
+ * interaction boost. 0 == no input seen yet. */
+static atomic64_t rfx_input_ts_ns = ATOMIC64_INIT(0);
 
 static inline bool rfx_gaming(void)
 {
@@ -292,6 +296,12 @@ static inline unsigned int rfx_floor_of_max(struct cpufreq_policy *policy, unsig
 	return max(f, policy->cpuinfo.min_freq);
 }
 
+/* Absolute kHz target clamped to the policy range (graceful on smaller SoCs). */
+static inline unsigned int rfx_abs(struct cpufreq_policy *policy, unsigned int khz)
+{
+	return clamp(khz, policy->cpuinfo.min_freq, policy->cpuinfo.max_freq);
+}
+
 static inline struct rfx_tunables *to_rfx_tunables(struct gov_attr_set *attr_set)
 {
 	return container_of(attr_set, struct rfx_tunables, attr_set);
@@ -321,53 +331,29 @@ static unsigned int rfx_ema_filter(struct rfx_policy *rfx_pol, unsigned int raw_
 	return ema;
 }
 
-/* ===================== Predictive thermal step-down ===================== */
+/* ===================== Thermal slope control ===================== */
 
-static void rfx_thermal_observe(struct rfx_policy *rfx_pol, unsigned int freq, u64 time)
-{
-	struct cpufreq_policy *policy = rfx_pol->policy;
-	unsigned int freq_pct;
-
-	if (!policy || !policy->cpuinfo.max_freq)
-		return;
-
-	if (!rfx_gaming()) {
-		rfx_pol->thermal_throttle_active = false;
-		rfx_pol->thermal_high_start_ns = 0;
-		return;
-	}
-
-	freq_pct = freq * 100 / policy->cpuinfo.max_freq;
-
-	if (freq_pct > RFX_THERMAL_HIGH_PCT) {
-		if (!rfx_pol->thermal_high_start_ns) {
-			rfx_pol->thermal_high_start_ns = time;
-		} else if (time - rfx_pol->thermal_high_start_ns > RFX_THERMAL_SETTLE_NS) {
-			rfx_pol->thermal_throttle_active = true;
-			rfx_pol->thermal_throttle_end_ns = time + RFX_THERMAL_THROTTLE_NS;
-		}
-	} else if (freq_pct < RFX_THERMAL_LOW_PCT) {
-		rfx_pol->thermal_high_start_ns = 0;
-		if (rfx_pol->thermal_throttle_active && time > rfx_pol->thermal_throttle_end_ns)
-			rfx_pol->thermal_throttle_active = false;
-	}
-}
-
-/* Returns the effective thermal cap percent: min(predictive, measured). */
+/* Walk the applied cap toward the published target a small step per STEP_NS so
+ * a thermal trip ramps down gradually instead of snapping (the FPS-crash
+ * "panic"); recover gently to avoid oscillation. Rate-limited by wall time so
+ * it is independent of how often the util hook fires. */
 static unsigned int rfx_thermal_cap(struct rfx_policy *rfx_pol, u64 time)
 {
-	unsigned int cap = atomic_read(&rfx_thermal_cap_pct);
+	unsigned int target = atomic_read(&rfx_thermal_cap_pct);
+	unsigned int sm = rfx_pol->thermal_cap_smoothed ?: 100;
 
-	if (cap > 100)
-		cap = 100;
+	if (target > 100)
+		target = 100;
 
-	if (rfx_pol->thermal_throttle_active) {
-		if (time < rfx_pol->thermal_throttle_end_ns)
-			cap = min(cap, (unsigned int)RFX_THERMAL_SOFT_CAP_PCT);
+	if (sm != target && time - rfx_pol->thermal_step_ns >= RFX_THERMAL_STEP_NS) {
+		rfx_pol->thermal_step_ns = time;
+		if (sm > target)
+			sm -= min(sm - target, (unsigned int)RFX_THERMAL_STEP_DOWN_PCT);
 		else
-			rfx_pol->thermal_throttle_active = false;
+			sm += min(target - sm, (unsigned int)RFX_THERMAL_STEP_UP_PCT);
+		rfx_pol->thermal_cap_smoothed = sm;
 	}
-	return cap;
+	return sm;
 }
 
 /* ===================== Frame pacing ===================== */
@@ -447,27 +433,25 @@ static inline bool rfx_frame_active(struct rfx_policy *rfx_pol, u64 time)
 	return rfx_pol->frame_boost_end_ns && time < rfx_pol->frame_boost_end_ns;
 }
 
-/* Returns true once a high load has persisted long enough to be a real render
- * load rather than a transient lobby burst. Also publishes burst_capped, which
- * tells rfx_calc_freq to hold an unconfirmed burst to a comfort cap. A genuine
- * frame overrun (userspace frame-pacing feed) is always treated as confirmed. */
+/* Returns true once a high load has persisted long enough to be real gameplay
+ * rather than a transient lobby blip. Gates ONLY the cluster-floor latch - it
+ * never caps frequency, since starving a real scene would just saturate the CPU
+ * and drop FPS. A brief dip decrements rather than resets the count, so
+ * fluctuating gameplay stays confirmed. A live frame-pacing feed forces it. */
 static bool rfx_spike_confirmed(struct rfx_policy *rfx_pol, unsigned int util_pct, u64 time)
 {
 	if (rfx_frame_active(rfx_pol, time)) {
 		rfx_pol->spike_confirm = RFX_GAMING_SPIKE_CONFIRM;
-		rfx_pol->burst_capped = false;
 		return true;
 	}
 
 	if (util_pct >= RFX_GAMING_HEAVY_ENTER_PCT) {
 		if (rfx_pol->spike_confirm < RFX_GAMING_SPIKE_CONFIRM)
 			rfx_pol->spike_confirm++;
-	} else if (util_pct < RFX_GAMING_BURST_CAP_PCT) {
-		rfx_pol->spike_confirm = 0;
+	} else if (rfx_pol->spike_confirm) {
+		rfx_pol->spike_confirm--;
 	}
 
-	rfx_pol->burst_capped = (util_pct >= RFX_GAMING_HEAVY_ENTER_PCT) &&
-				(rfx_pol->spike_confirm < RFX_GAMING_SPIKE_CONFIRM);
 	return rfx_pol->spike_confirm >= RFX_GAMING_SPIKE_CONFIRM;
 }
 
@@ -548,20 +532,20 @@ static unsigned int rfx_calc_freq(struct rfx_policy *rfx_pol, unsigned long util
 		/* Floors (keep threads off the wall) then caps (leave headroom). */
 		if (prime) {
 			if (is_heavy)
-				freq = max(freq, rfx_floor_of_max(policy, RFX_GAMING_FLOOR_PRIME_PCT));
+				freq = max(freq, rfx_abs(policy, RFX_GAMING_FLOOR_PRIME_KHZ));
 			freq = min(freq, rfx_pct_of_max(policy, RFX_GAMING_CAP_PRIME_PCT));
 		} else if (!little) {
 			if (is_heavy)
-				freq = max(freq, rfx_floor_of_max(policy, RFX_GAMING_FLOOR_BIG_PCT));
+				freq = max(freq, rfx_abs(policy, RFX_GAMING_FLOOR_BIG_KHZ));
 			freq = min(freq, rfx_pct_of_max(policy, RFX_GAMING_CAP_BIG_PCT));
 		} else {
-			/* Hold a mid floor while heavy so the LITTLE cluster stops
-			 * free-falling to ~10% and then snapping back up - that
-			 * 10%<->85% oscillation is a major jank source. Floor < cap
-			 * still leaves room to idle down between bursts. */
+			/* LITTLE: hold a tight efficient band while heavy (floor ~1.0GHz,
+			 * cap ~1.2GHz) so it neither free-falls to ~10% nor ramps to
+			 * 1.5-1.8GHz. Background work runs cheaply; raise the cap on-device
+			 * only if Big/Prime genuinely saturate (left as a userspace knob). */
 			if (is_heavy)
-				freq = max(freq, rfx_floor_of_max(policy, RFX_GAMING_FLOOR_LITTLE_PCT));
-			freq = min(freq, rfx_pct_of_max(policy, RFX_GAMING_LITTLE_CAP_PCT));
+				freq = max(freq, rfx_abs(policy, RFX_GAMING_FLOOR_LITTLE_KHZ));
+			freq = min(freq, rfx_abs(policy, RFX_GAMING_CAP_LITTLE_KHZ));
 		}
 
 		/* Frame-overrun floor boost (overrides comfort caps to clear jank). */
@@ -597,9 +581,18 @@ static unsigned int rfx_calc_freq(struct rfx_policy *rfx_pol, unsigned long util
 	if (tcap < 100)
 		freq = min(freq, rfx_pct_of_max(policy, tcap));
 
-	/* Input boost floor (touch latency). */
-	if (rfx_pol->input_boost_end_ns && time < rfx_pol->input_boost_end_ns)
-		freq = max(freq, rfx_pol->input_boost_freq);
+	/* Interaction burst boost (daily only): for a short window after a real
+	 * touch/key event, hold Little/Big at a scroll-friendly floor so a UI
+	 * swipe ramps instantly, then expire for a fast decay to idle. Prime is
+	 * excluded - UI never needs it. The timestamp is set by the governor's
+	 * own input handler (no vendor cpu-input-boost driver, no gaming conflict). */
+	if (!rfx_gaming() && !prime) {
+		u64 in_ts = atomic64_read(&rfx_input_ts_ns);
+
+		if (in_ts && time - in_ts < RFX_INTERACT_WINDOW_NS)
+			freq = max(freq, rfx_abs(policy, little ? RFX_INTERACT_LITTLE_KHZ
+								: RFX_INTERACT_BIG_KHZ));
+	}
 
 	freq = min(freq, policy->max);
 
@@ -703,8 +696,6 @@ static void rfx_clear_expired(struct rfx_policy *rfx_pol, u64 time)
 {
 	if (rfx_pol->interactive_end_ns && time >= rfx_pol->interactive_end_ns)
 		rfx_pol->interactive_end_ns = 0;
-	if (rfx_pol->input_boost_end_ns && time >= rfx_pol->input_boost_end_ns)
-		rfx_pol->input_boost_end_ns = 0;
 	if (rfx_pol->frame_boost_end_ns && time >= rfx_pol->frame_boost_end_ns)
 		rfx_pol->frame_boost_end_ns = 0;
 	if (rfx_pol->gaming_lock_end_ns && time >= rfx_pol->gaming_lock_end_ns &&
@@ -725,17 +716,14 @@ static unsigned int rfx_decide(struct rfx_cpu *lead, u64 time, unsigned long poo
 	ema_pct = rfx_ema_filter(rfx_pol, util_pct);
 	eff_pct = max(ema_pct, util_pct);		/* never below the raw demand */
 
-	/* Gaming: hold an unconfirmed high-load burst (lobby asset load) to a
-	 * comfort cap so it cannot ramp the cluster to f_max. EMA itself is
-	 * untouched - this only bounds the value handed to freq selection. */
-	if (rfx_gaming()) {
+	/* Gaming: a high load must persist before it latches the sustained cluster
+	 * floors (anti lobby-blip). Frequency itself always follows demand - capping
+	 * a real scene to "reject a spike" only saturates the CPU and drops FPS. */
+	if (rfx_gaming())
 		confirmed = rfx_spike_confirmed(rfx_pol, util_pct, time);
-		if (rfx_pol->burst_capped)
-			eff_pct = min(eff_pct, (unsigned int)RFX_GAMING_BURST_CAP_PCT);
-	}
 
 	effective = max_cap * eff_pct / 100;
-	if (effective < pooled_util && !rfx_pol->burst_capped)
+	if (effective < pooled_util)
 		effective = pooled_util;		/* never below PELT+iowait */
 
 	/* Idle detection (daily only): confirm with the NOHZ idle-call counter
@@ -768,7 +756,6 @@ static unsigned int rfx_decide(struct rfx_cpu *lead, u64 time, unsigned long poo
 		   (rfx_pol->gaming_lock_end_ns && time < rfx_pol->gaming_lock_end_ns);
 
 	next_f = rfx_calc_freq(rfx_pol, effective, max_cap, is_heavy, time);
-	rfx_thermal_observe(rfx_pol, next_f, time);
 
 	/* Sustain hold on a sharp drop while heavy (anti-jank). */
 	if (is_heavy && lead->prev_util_pct > RFX_BURST_DROP_THRESHOLD &&
@@ -957,38 +944,6 @@ static ssize_t down_rate_limit_us_store(struct gov_attr_set *attr_set, const cha
 }
 static struct governor_attr down_rate_limit_us = __ATTR_RW(down_rate_limit_us);
 
-static ssize_t input_boost_ms_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n", to_rfx_tunables(attr_set)->input_boost_ms);
-}
-static ssize_t input_boost_ms_store(struct gov_attr_set *attr_set, const char *buf, size_t count)
-{
-	struct rfx_tunables *t = to_rfx_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val))
-		return -EINVAL;
-	t->input_boost_ms = val;
-	return count;
-}
-static struct governor_attr input_boost_ms = __ATTR_RW(input_boost_ms);
-
-static ssize_t input_boost_pct_show(struct gov_attr_set *attr_set, char *buf)
-{
-	return sprintf(buf, "%u\n", to_rfx_tunables(attr_set)->input_boost_pct);
-}
-static ssize_t input_boost_pct_store(struct gov_attr_set *attr_set, const char *buf, size_t count)
-{
-	struct rfx_tunables *t = to_rfx_tunables(attr_set);
-	unsigned int val;
-
-	if (kstrtouint(buf, 10, &val) || val > 100)
-		return -EINVAL;
-	t->input_boost_pct = val;
-	return count;
-}
-static struct governor_attr input_boost_pct = __ATTR_RW(input_boost_pct);
-
 /* Global (cross-policy) knobs, backed by atomics. */
 static ssize_t gaming_mode_show(struct gov_attr_set *attr_set, char *buf)
 {
@@ -1007,14 +962,10 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set, const char *buf,
 	if (!val) {
 		list_for_each_entry(pol, &attr_set->policy_list, tunables_hook) {
 			pol->gaming_lock_end_ns = 0;
-			pol->input_boost_end_ns = 0;
 			pol->frame_boost_end_ns = 0;
-			pol->thermal_throttle_active = false;
-			pol->thermal_high_start_ns = 0;
 			pol->sustain_hold_end_ns = 0;
 			pol->in_heavy_mode = false;
 			pol->spike_confirm = 0;
-			pol->burst_capped = false;
 			pol->need_freq_update = true;
 		}
 	}
@@ -1078,8 +1029,6 @@ static struct attribute *rfx_big_attrs[] = {
 	&rate_limit_us.attr,
 	&up_rate_limit_us.attr,
 	&down_rate_limit_us.attr,
-	&input_boost_ms.attr,
-	&input_boost_pct.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(rfx_big);
@@ -1088,8 +1037,6 @@ static struct attribute *rfx_prime_attrs[] = {
 	&rate_limit_us.attr,
 	&up_rate_limit_us.attr,
 	&down_rate_limit_us.attr,
-	&input_boost_ms.attr,
-	&input_boost_pct.attr,
 	&gaming_mode.attr,
 	&thermal_cap_pct.attr,
 	&frame_time_us.attr,
@@ -1253,9 +1200,6 @@ static int rfx_init(struct cpufreq_policy *policy)
 		goto stop_kthread;
 	}
 
-	t->input_boost_ms = 150;
-	t->input_boost_pct = RFX_INPUT_BOOST_FREQ_PCT;
-
 	max_cap = arch_scale_cpu_capacity(cpumask_first(policy->cpus));
 	if (rfx_is_little(max_cap)) {
 		t->cluster_type = RFX_CLUSTER_LITTLE;
@@ -1344,20 +1288,16 @@ static int rfx_start(struct cpufreq_policy *policy)
 	rfx_pol->cached_raw_freq = 0;
 	rfx_pol->need_freq_update = false;
 	rfx_pol->gaming_lock_end_ns = 0;
-	rfx_pol->input_boost_end_ns = 0;
-	rfx_pol->input_boost_freq = 0;
 	rfx_pol->frame_boost_end_ns = 0;
 	rfx_pol->sustain_hold_end_ns = 0;
 	rfx_pol->interactive_end_ns = 0;
-	rfx_pol->thermal_high_start_ns = 0;
-	rfx_pol->thermal_throttle_end_ns = 0;
-	rfx_pol->thermal_throttle_active = false;
+	rfx_pol->thermal_cap_smoothed = 100;
+	rfx_pol->thermal_step_ns = now;
 	rfx_pol->in_deep_idle = false;
 	rfx_pol->last_real_update_ns = now;
 	rfx_pol->in_heavy_mode = false;
 	rfx_pol->ema_util_pct = 0;
 	rfx_pol->spike_confirm = 0;
-	rfx_pol->burst_capped = false;
 
 	uu = policy_is_shared(policy) ? rfx_update_shared : rfx_update_single;
 
@@ -1419,14 +1359,93 @@ struct cpufreq_governor *cpufreq_default_governor(void)
 }
 #endif
 
+/* ===================== Input handler (daily interaction boost) ===================== */
+
+/* Runs in input-event context (dev->event_lock held) - keep it to an atomic
+ * store. The fast path reads the stamp and applies the boost only in daily mode. */
+static void rfx_input_event(struct input_handle *handle, unsigned int type,
+			    unsigned int code, int value)
+{
+	if (type == EV_ABS || type == EV_KEY)
+		atomic64_set(&rfx_input_ts_ns, ktime_get_ns());
+}
+
+static int rfx_input_connect(struct input_handler *handler, struct input_dev *dev,
+			     const struct input_device_id *id)
+{
+	struct input_handle *handle;
+	int error;
+
+	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
+	if (!handle)
+		return -ENOMEM;
+
+	handle->dev = dev;
+	handle->handler = handler;
+	handle->name = "vorpal";
+
+	error = input_register_handle(handle);
+	if (error)
+		goto err_free;
+	error = input_open_device(handle);
+	if (error)
+		goto err_unregister;
+	return 0;
+
+err_unregister:
+	input_unregister_handle(handle);
+err_free:
+	kfree(handle);
+	return error;
+}
+
+static void rfx_input_disconnect(struct input_handle *handle)
+{
+	input_close_device(handle);
+	input_unregister_handle(handle);
+	kfree(handle);
+}
+
+static const struct input_device_id rfx_input_ids[] = {
+	/* multi-touch touchscreen */
+	{
+		.flags = INPUT_DEVICE_ID_MATCH_EVBIT | INPUT_DEVICE_ID_MATCH_ABSBIT,
+		.evbit = { BIT_MASK(EV_ABS) },
+		.absbit = { [BIT_WORD(ABS_MT_POSITION_X)] = BIT_MASK(ABS_MT_POSITION_X) },
+	},
+	/* keys / buttons */
+	{
+		.flags = INPUT_DEVICE_ID_MATCH_EVBIT,
+		.evbit = { BIT_MASK(EV_KEY) },
+	},
+	{ },
+};
+
+static struct input_handler rfx_input_handler = {
+	.event		= rfx_input_event,
+	.connect	= rfx_input_connect,
+	.disconnect	= rfx_input_disconnect,
+	.name		= "vorpal_boost",
+	.id_table	= rfx_input_ids,
+};
+
 static int __init vorpal_init(void)
 {
+	int ret;
+
 	pr_info("Vorpal Governor v%s by %s\n", CPUFREQ_VORPAL_VERSION, CPUFREQ_VORPAL_AUTHOR);
-	return cpufreq_register_governor(&vorpal_gov);
+	ret = cpufreq_register_governor(&vorpal_gov);
+	if (ret)
+		return ret;
+
+	if (input_register_handler(&rfx_input_handler))
+		pr_warn("vorpal: input handler register failed; interaction boost off\n");
+	return 0;
 }
 
 static void __exit vorpal_exit(void)
 {
+	input_unregister_handler(&rfx_input_handler);
 	cpufreq_unregister_governor(&vorpal_gov);
 }
 
