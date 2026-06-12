@@ -112,18 +112,37 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 #define RFX_GAMING_DOWN_US		30000
 
 /* ---- Gaming frequency band, percent of policy fmax ---- */
-/* Prime: render thread. High floor, near-max cap, frame-miss boost. */
-#define RFX_G_PRIME_FLOOR_PCT		88
+/*
+ * Prime: holds the render thread WHEN one is scheduled here. Telemetry from
+ * real titles (Delta Force) shows the game often spreads its threads across
+ * Big/Little and leaves Prime near-idle; a static high floor on an idle Prime
+ * is pure waste heat with no FPS benefit. So the floor is ADAPTIVE: lock high
+ * only once Prime is genuinely busy (util >= BUSY_ENTER), otherwise drop to a
+ * lower idle floor that still recovers instantly (up-rate is 0 + headroom +
+ * frame boost) the moment a heavy thread lands here.
+ */
+#define RFX_G_PRIME_FLOOR_PCT		90	/* busy: locked high */
+#define RFX_G_PRIME_IDLE_FLOOR_PCT	65	/* near-idle: save heat */
+#define RFX_G_PRIME_BUSY_ENTER_PCT	30
 #define RFX_G_PRIME_CAP_PCT		99
 #define RFX_G_PRIME_FRAME_PCT		95
-/* Big: game logic. Locked high but a little below Prime for power. */
-#define RFX_G_BIG_FLOOR_PCT		78
-#define RFX_G_BIG_CAP_PCT		90
-#define RFX_G_BIG_FRAME_PCT		88
-/* Little: stays dynamic. Floor only kicks in once it is genuinely busy. */
-#define RFX_G_LITTLE_CAP_PCT		85
-#define RFX_G_LITTLE_FLOOR_PCT		30
-#define RFX_G_LITTLE_FLOOR_ENTER_PCT	25
+/*
+ * Big: in practice this cluster carries most of the game load. A cap of 90%
+ * made it saturate (load 80%+) and starve frames; raised to 96% so the cores
+ * that actually do the work have headroom -> load drops, frames land on time.
+ */
+#define RFX_G_BIG_FLOOR_PCT		80
+#define RFX_G_BIG_CAP_PCT		96
+#define RFX_G_BIG_FRAME_PCT		92
+/*
+ * Little: kept dynamic, but it too gets overloaded by render work, so its cap
+ * is raised (85->95) to stop the 60-90% saturation that telemetry showed, and
+ * it now honours the frame-miss boost.
+ */
+#define RFX_G_LITTLE_CAP_PCT		95
+#define RFX_G_LITTLE_FLOOR_PCT		42
+#define RFX_G_LITTLE_FLOOR_ENTER_PCT	20
+#define RFX_G_LITTLE_FRAME_PCT		80
 
 /* ---- Daily frequency shaping, percent of policy fmax ---- */
 #define RFX_D_LITTLE_CAP_PCT		55	/* battery: cap LITTLE low */
@@ -151,10 +170,14 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 #define RFX_THERMAL_MIN_CAP_PCT		50
 #define RFX_THERMAL_POLL_GAMING_MS	50
 #define RFX_THERMAL_POLL_IDLE_MS	200
-/* Temperature breakpoints (milli-Celsius) -> target cap percent. */
-#define RFX_TEMP_GREEN_MC		38000
-#define RFX_TEMP_YELLOW_MC		42000
-#define RFX_TEMP_RED_MC			44000
+/*
+ * Temperature breakpoints (milli-Celsius) -> target cap percent. GREEN raised
+ * 38->40 so the cap stays at 100% through normal gameplay temps; throttling
+ * that starts too early is felt as the residual jitter under load.
+ */
+#define RFX_TEMP_GREEN_MC		40000
+#define RFX_TEMP_YELLOW_MC		43000
+#define RFX_TEMP_RED_MC			45000
 
 /* ---- Frame pacing ---- */
 #define RFX_FRAME_BUDGET_US_120		8333	/* 1e6/120 */
@@ -195,6 +218,14 @@ static atomic_t rfx_frame_budget_us = ATOMIC_INIT(RFX_FRAME_BUDGET_US_120);
 static atomic_t rfx_frames_seen = ATOMIC_INIT(0);
 static atomic_t rfx_janks_seen = ATOMIC_INIT(0);
 static atomic_t rfx_jank_pct = ATOMIC_INIT(0);
+
+/*
+ * Frame-miss boost deadline (ns since boot), GLOBAL so every cluster reacts to
+ * a dropped frame - not just Prime. A missed frame means SOME cluster was too
+ * slow; since the render thread's placement is not known in-kernel, all of
+ * Prime/Big/Little lift their floor together until this deadline.
+ */
+static atomic64_t rfx_frame_boost_end_ns = ATOMIC64_INIT(0);
 
 /* All live policies, so gaming-off can reset every cluster (not just Prime). */
 static LIST_HEAD(rfx_policy_list);
@@ -242,8 +273,6 @@ struct rfx_policy {
 
 	bool is_prime;			/* this policy is the Prime cluster */
 	bool is_little;
-
-	u64 frame_boost_end_ns;		/* gaming: recover a missed frame */
 
 	int thermal_applied_pct;	/* walked toward rfx_thermal_cap_pct */
 	u64 thermal_step_ns;
@@ -426,7 +455,7 @@ static unsigned int rfx_thermal_clamp(struct rfx_policy *p, unsigned int freq,
  * next frames recover to 120fps. The boost lifts the floor (see target_freq),
  * never forces fmax, so load stays mid.
  */
-static void rfx_frame_account(struct rfx_policy *p, u64 time)
+static void rfx_frame_account(u64 time)
 {
 	unsigned int ft = atomic_read(&rfx_frame_time_us);
 	unsigned int bud = atomic_read(&rfx_frame_budget_us);
@@ -437,8 +466,15 @@ static void rfx_frame_account(struct rfx_policy *p, u64 time)
 	atomic_inc(&rfx_frames_seen);
 	if (ft > bud + (bud >> 1)) {
 		atomic_inc(&rfx_janks_seen);
-		p->frame_boost_end_ns = time + RFX_FRAME_BOOST_NS;
+		atomic64_set(&rfx_frame_boost_end_ns, time + RFX_FRAME_BOOST_NS);
 	}
+}
+
+static inline bool rfx_frame_boost_active(u64 time)
+{
+	u64 end = (u64)atomic64_read(&rfx_frame_boost_end_ns);
+
+	return end && time < end;
 }
 
 /* ===================================================================== */
@@ -472,43 +508,45 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 	freq = clamp(freq, fmin, fmax);
 
 	if (gaming) {
+		bool fboost = rfx_frame_boost_active(time);
+
 		if (prime) {
-			unsigned int fl = rfx_pct(fmax, RFX_G_PRIME_FLOOR_PCT);
+			/*
+			 * Adaptive floor: only lock Prime high once it is doing
+			 * real work, so a game that parks its threads elsewhere
+			 * does not leave Prime burning power at 90% for nothing.
+			 */
+			unsigned int fl = (upct >= RFX_G_PRIME_BUSY_ENTER_PCT) ?
+				rfx_pct(fmax, RFX_G_PRIME_FLOOR_PCT) :
+				rfx_pct(fmax, RFX_G_PRIME_IDLE_FLOOR_PCT);
 			unsigned int cap = rfx_pct(fmax, RFX_G_PRIME_CAP_PCT);
 
+			if (fboost)
+				fl = max(fl, rfx_pct(fmax, RFX_G_PRIME_FRAME_PCT));
 			if (freq < fl)
 				freq = fl;
 			if (freq > cap)
 				freq = cap;
-			if (time < p->frame_boost_end_ns) {
-				unsigned int b = rfx_pct(fmax, RFX_G_PRIME_FRAME_PCT);
-
-				if (freq < b)
-					freq = b;
-			}
-		} else if (!little) {		/* Big */
+		} else if (!little) {		/* Big: carries most load */
 			unsigned int fl = rfx_pct(fmax, RFX_G_BIG_FLOOR_PCT);
 			unsigned int cap = rfx_pct(fmax, RFX_G_BIG_CAP_PCT);
 
+			if (fboost)
+				fl = max(fl, rfx_pct(fmax, RFX_G_BIG_FRAME_PCT));
 			if (freq < fl)
 				freq = fl;
 			if (freq > cap)
 				freq = cap;
-			if (time < p->frame_boost_end_ns) {
-				unsigned int b = rfx_pct(fmax, RFX_G_BIG_FRAME_PCT);
-
-				if (freq < b)
-					freq = b;
-			}
 		} else {			/* Little: dynamic, soft floor */
 			unsigned int cap = rfx_pct(fmax, RFX_G_LITTLE_CAP_PCT);
+			unsigned int fl = 0;
 
-			if (upct > RFX_G_LITTLE_FLOOR_ENTER_PCT) {
-				unsigned int fl = rfx_pct(fmax, RFX_G_LITTLE_FLOOR_PCT);
-
-				if (freq < fl)
-					freq = fl;
-			}
+			if (upct > RFX_G_LITTLE_FLOOR_ENTER_PCT)
+				fl = rfx_pct(fmax, RFX_G_LITTLE_FLOOR_PCT);
+			if (fboost)
+				fl = max(fl, rfx_pct(fmax, RFX_G_LITTLE_FRAME_PCT));
+			if (freq < fl)
+				freq = fl;
 			if (freq > cap)
 				freq = cap;
 		}
@@ -728,8 +766,8 @@ static void rfx_update_single_freq(struct update_util_data *hook, u64 time,
 	eff = max(rfx_c->util, boost);
 	rfx_c->filt_util = rfx_ema(rfx_c->filt_util, eff, gaming);
 
-	if (gaming && p->is_prime)
-		rfx_frame_account(p, time);
+	if (gaming)
+		rfx_frame_account(time);
 
 	rfx_set_down_delay(p, gaming);
 	rfx_pol_up_delay(p, gaming);
@@ -769,8 +807,8 @@ static unsigned int rfx_next_freq_shared(struct rfx_cpu *rfx_c, u64 time,
 			max_util = jc->filt_util;
 	}
 
-	if (gaming && p->is_prime)
-		rfx_frame_account(p, time);
+	if (gaming)
+		rfx_frame_account(time);
 
 	rfx_set_down_delay(p, gaming);
 	rfx_pol_up_delay(p, gaming);
@@ -1016,11 +1054,11 @@ static void rfx_reset_all_policies(void)
 	struct rfx_policy *p;
 	unsigned long flags;
 
+	atomic64_set(&rfx_frame_boost_end_ns, 0);
+
 	spin_lock_irqsave(&rfx_policy_list_lock, flags);
-	list_for_each_entry(p, &rfx_policy_list, gov_node) {
-		p->frame_boost_end_ns = 0;
+	list_for_each_entry(p, &rfx_policy_list, gov_node)
 		p->need_freq_update = true;
-	}
 	spin_unlock_irqrestore(&rfx_policy_list_lock, flags);
 }
 
@@ -1425,7 +1463,6 @@ static int rfx_start(struct cpufreq_policy *policy)
 	p->work_in_progress = false;
 	p->limits_changed = false;
 	p->need_freq_update = false;
-	p->frame_boost_end_ns = 0;
 	p->thermal_applied_pct = 100;
 	p->thermal_step_ns = now;
 
