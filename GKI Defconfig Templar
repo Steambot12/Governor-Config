@@ -1,6 +1,6 @@
 #
 # Automatically generated file; DO NOT EDIT.
-# Linux/arm64 Beta 7 Kernel Configuration
+# Linux/arm64 5.10.253 1-5-LinuxStable Kernel Configuration
 #
 CONFIG_CC_VERSION_TEXT="Android (7284624, based on r416183b) clang version 12.0.5 (https://android.googlesource.com/toolchain/llvm-project c935d99d7cf2016289302412d708641d52d2f7ee)"
 CONFIG_GCC_VERSION=0
@@ -17,6 +17,7 @@ CONFIG_CC_HAS_ASM_GOTO_OUTPUT=y
 CONFIG_TOOLS_SUPPORT_RELR=y
 CONFIG_CC_HAS_ASM_INLINE=y
 CONFIG_IRQ_WORK=y
+CONFIG_KTHREAD_WORKER=y
 CONFIG_BUILDTIME_TABLE_SORT=y
 CONFIG_THREAD_INFO_IN_TASK=y
 
@@ -114,6 +115,7 @@ CONFIG_CPU_ISOLATION=y
 CONFIG_TREE_RCU=y
 CONFIG_PREEMPT_RCU=y
 CONFIG_RCU_EXPERT=y
+CONFIG_RCU_EXPEDITE_BOOT=y
 CONFIG_SRCU=y
 CONFIG_TREE_SRCU=y
 CONFIG_TASKS_RCU_GENERIC=y
@@ -170,6 +172,7 @@ CONFIG_BLK_CGROUP=y
 CONFIG_CGROUP_WRITEBACK=y
 CONFIG_CGROUP_SCHED=y
 CONFIG_CGROUP_SCHEDTUNE=y
+CONFIG_SCHED_CORE=y
 CONFIG_SCHED_CORE_CTL=y
 CONFIG_FAIR_GROUP_SCHED=y
 # CONFIG_CFS_BANDWIDTH is not set
@@ -559,7 +562,7 @@ CONFIG_RELOCATABLE=y
 CONFIG_RANDOMIZE_BASE=y
 # CONFIG_RANDOMIZE_MODULE_REGION_FULL is not set
 # CONFIG_STACKPROTECTOR_PER_TASK is not set
-CONFIG_CMDLINE="stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=none cgroup_disable=pressure cgroup.memory=nokmem noirqdebug audit=0 loglevel=3 thermal.off=0 thermal_step_size=2 thermal.polling_delay=250 rcu_nocbs=0-7 rcu_nocb_poll rcupdate.rcu_lazy_ms=1000 rcupdate.rcu_idle_gp_delay=3 nohz=on timer_migration=1 transparent_hugepage=madvise cpuidle.off=0 cpuidle.promotion=3 cpuidle.demotion=5 thermal_pressure=1 pm_async_timeout=30000 workqueue.power_efficient=1 sched_util_clamp_min_rt_default=0"
+CONFIG_CMDLINE="stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=none cgroup.memory=nokmem noirqdebug audit=0 loglevel=3 thermal.off=0 thermal_step_size=5 thermal.polling_delay=50 rcu_nocbs=7 rcupdate.rcu_lazy_ms=100 rcupdate.rcu_idle_gp_delay=3 nohz=on timer_migration=1 transparent_hugepage=madvise cpuidle.off=0 cpuidle.promotion=1 cpuidle.demotion=2 thermal_pressure=1 pm_async_timeout=5000 workqueue.power_efficient=1 sched_util_clamp_min_rt_default=1024"
 # end of Kernel Features
 
 #
@@ -642,6 +645,7 @@ CONFIG_CPU_BOOST=y
 CONFIG_CPU_FREQ_POWER_SAVE_BIAS=15
 CONFIG_CPU_FREQ_ADAPTIVE_THRESHOLD=y
 CONFIG_CPU_FREQ_IDLE_DETECTION=y
+CONFIG_CPU_FREQ_FAST_SWITCH=y
 # end of CPU Boost configuration
 
 #
@@ -3201,7 +3205,7 @@ CONFIG_THERMAL_DEFAULT_GOV_STEP_WISE=y
 # CONFIG_THERMAL_DEFAULT_GOV_FAIR_SHARE is not set
 # CONFIG_THERMAL_DEFAULT_GOV_USER_SPACE is not set
 # CONFIG_THERMAL_DEFAULT_GOV_POWER_ALLOCATOR is not set
-# CONFIG_THERMAL_GOV_FAIR_SHARE is not set
+CONFIG_THERMAL_GOV_FAIR_SHARE=y
 # CONFIG_THERMAL_GOV_BANG_BANG is not set
 CONFIG_THERMAL_GOV_USER_SPACE=y
 CONFIG_THERMAL_GOV_POWER_ALLOCATOR=y
@@ -5164,7 +5168,7 @@ CONFIG_STAGING=y
 #
 CONFIG_ASHMEM=y
 CONFIG_DEBUG_KINFO=y
-# CONFIG_ION is not set
+CONFIG_ION=y
 # end of Android
 
 # CONFIG_STAGING_BOARD is not set
