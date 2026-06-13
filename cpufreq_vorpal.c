@@ -1,37 +1,28 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Vorpal CPUFreq Governor v6.0
+ * Vorpal CPUFreq Governor v2.0 - Perfect Gaming & Thermal Edition
+ * Based on schedutil — optimized for 120fps gaming & daily use
  *
- * A schedutil-derived governor with two explicit operating profiles:
- *
- *   gaming_mode = 0 (DAILY)  : power-efficient, but UI stays responsive.
- *                              LITTLE is capped low, touch input lifts a short
- *                              floor, idle collapses to fmin. Fast-up / medium-
- *                              down util EMA keeps scrolling smooth without
- *                              holding clocks high.
- *
- *   gaming_mode = 1 (GAMING) : Prime + Big are LOCKED into a high band (floor +
- *                              cap) with a long down-rate-limit, so all-core
- *                              frequency is stable - no yoyo, no sawtooth - yet
- *                              the band is chosen so CPU load stays ~50-60%.
- *                              LITTLE is left dynamic (background / UI work does
- *                              not need a lock) to keep the package in budget.
- *                              The decision path ignores every daily relaxation,
- *                              so the gaming profile cannot be loosened from
- *                              inside the kernel while it is active.
- *
- * Cross-cutting controllers (both profiles):
- *   - Thermal step controller. A delayed_work poller (slow path) samples a
- *     temperature source and publishes a target cap percent into an atomic.
- *     The fast path walks an APPLIED cap toward that target in small 2%-down /
- *     1%-up steps, so throttling ramps smoothly instead of snapping - the cap
- *     is the final clamp, guaranteeing a power/thermal ceiling. No sensor is
- *     ever read in the atomic util hook (it can sleep).
- *   - Frame pacing. Userspace (tools/vorpal feeder) writes the measured frame
- *     time; on an overrun the governor arms a short, bounded P-state floor
- *     boost to recover a missed 120fps frame without pinning to fmax.
- *   - Scheduler coupling. gaming_mode drives sched_gaming_active (exported by
- *     kernel/sched/fair.c) so the BORE/CFS gaming biases activate in lockstep.
+ * Features:
+ *   • Dual-Profile Operating Modes      	— Gaming (locked high-band) / Daily (power-efficient)
+ *   • Tri-Cluster Topology Awareness    	— Independent tuning for Little / Big / Prime
+ *   • Directional EMA Util Smoothing    	— Fast-rise / slow-decay anti-yoyo filter
+ *   • Dynamic Capacity Headroom         	— Load-proportional OPP headroom allocation
+ *   • Proactive Thermal Step Controller 	— Smooth 2%-down / 1%-up cap ramping
+ *   • Thermal Zone Integration          	— Hardware sensor + userspace fallback
+ *   • Frame Pacing & Miss Recovery      	— Bounded floor boost on 120fps overrun
+ *   • Global Frame Boost                	— All-cluster sync on dropped frames
+ *   • Touch Input Responsiveness Boost  	— 220ms touch-window floor lift
+ *   • UI Ramp-Assist / Render Burst     	— Sharp util-rise detection for animations
+ *   • Adaptive Floor (Idle/Busy)        	— Prime & Little dynamic floor switching
+ *   • Directional Rate Limiting         	— Per-cluster up/down rate gates
+ *   • IOWait Performance Boost          	— Schedutil-legacy IOWait handling
+ *   • Deadline Bandwidth Awareness      	— DL task frequency bypass
+ *   • Jank Telemetry & Statistics       	— Frame/jank ratio reporting
+ *   • Deferred IRQ-Work Frequency Commit 	— Async non-fast-switch path
+ *   • Global Policy State Reset         	— Clean gaming-off transition
+ *   • GKI 5.10 Util Interface           	— rfx_get_util_gki510 / rfx_dl_bw_exceeded_gki510
+ *   • Scheduler Coupling              		— BORE/CFS gaming biases via sched_gaming_active
  *
  * Author: Templar Dev (Steambot12)
  */
@@ -68,7 +59,7 @@
 #endif
 
 #define CPUFREQ_VORPAL_NAME     "vorpal"
-#define CPUFREQ_VORPAL_VERSION  "6.0"
+#define CPUFREQ_VORPAL_VERSION  "2.0"
 #define CPUFREQ_VORPAL_AUTHOR   "Templar Dev"
 
 /*
@@ -145,17 +136,40 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 #define RFX_G_LITTLE_FRAME_PCT		80
 
 /* ---- Daily frequency shaping, percent of policy fmax ---- */
-#define RFX_D_LITTLE_CAP_PCT		55	/* battery: cap LITTLE low */
-#define RFX_D_LITTLE_TOUCH_CAP_PCT	85	/* relax cap briefly on touch */
-#define RFX_D_LITTLE_TOUCH_PCT		55	/* LITTLE floor during touch */
-#define RFX_D_BIG_TOUCH_PCT		50	/* Big floor during touch */
+/*
+ * "UI active" = a touch is recent OR a render burst was just detected (see
+ * the ramp-assist below). When active, LITTLE's cap is relaxed and LITTLE/Big
+ * get a responsiveness floor so animations / captions / scrolls do not run at
+ * a starved OPP. When idle, LITTLE is capped low for battery.
+ */
+#define RFX_D_LITTLE_CAP_PCT		65	/* battery: cap LITTLE (was 55) */
+#define RFX_D_LITTLE_BOOST_CAP_PCT	90	/* relax cap while UI active */
+#define RFX_D_LITTLE_UI_FLOOR_PCT	58	/* LITTLE floor while UI active */
+#define RFX_D_BIG_UI_FLOOR_PCT		55	/* Big floor while UI active */
 
-/* Touch responsiveness window after the last input event. */
-#define RFX_INPUT_WINDOW_NS		(90 * NSEC_PER_MSEC)
+/*
+ * Daily UI ramp-assist. PELT/WALT util lags the real frame work, and the most
+ * stutter-prone UI moments (a video caption appearing, an app open/close
+ * animation, a fling-scroll) are often NOT touch events, so a touch-only boost
+ * misses them. Instead we watch the smoothed util for a sharp RISE: a jump of
+ * >= RFX_D_RAMP_DELTA_PCT points arms a short floor that holds for
+ * RFX_D_UI_BOOST_NS, re-arming as long as demand keeps climbing. This lifts the
+ * first frames of a burst immediately, independent of input - the core fix for
+ * the gaming_mode=0 display/UI stutter.
+ */
+#define RFX_D_RAMP_DELTA_PCT		12
+#define RFX_D_UI_BOOST_NS		(150 * NSEC_PER_MSEC)
+
+/*
+ * Touch window, lengthened 90 -> 220 ms so a tap-initiated app open/close
+ * animation (~300 ms) stays boosted through the whole transition instead of
+ * sagging halfway when the old short window expired.
+ */
+#define RFX_INPUT_WINDOW_NS		(220 * NSEC_PER_MSEC)
 
 /* ---- Util EMA (directional smoothing). new>old: up_shift, else down_shift ---- */
-#define RFX_EMA_UP_SHIFT_DAILY		2
-#define RFX_EMA_DN_SHIFT_DAILY		2
+#define RFX_EMA_UP_SHIFT_DAILY		1	/* rise fast: kill PELT-lag stutter */
+#define RFX_EMA_DN_SHIFT_DAILY		3	/* decay gently: no inter-frame sag */
 #define RFX_EMA_UP_SHIFT_GAMING		1	/* react fast to a demand rise */
 #define RFX_EMA_DN_SHIFT_GAMING		3	/* decay slowly -> anti-jitter */
 
@@ -273,6 +287,9 @@ struct rfx_policy {
 
 	bool is_prime;			/* this policy is the Prime cluster */
 	bool is_little;
+
+	unsigned int prev_upct;		/* last util%, for daily ramp detect */
+	u64 ui_boost_end_ns;		/* daily: UI render-burst floor hold */
 
 	int thermal_applied_pct;	/* walked toward rfx_thermal_cap_pct */
 	u64 thermal_step_ns;
@@ -551,23 +568,36 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 				freq = cap;
 		}
 	} else {
-		bool touch = rfx_input_active(time);
+		bool ui_active;
+
+		/*
+		 * Detect a render burst: a sharp rise in smoothed util re-arms
+		 * the UI floor. Catches caption draws / open-close animations /
+		 * fling-scrolls that touch detection alone would miss.
+		 */
+		if (upct > p->prev_upct &&
+		    upct - p->prev_upct >= RFX_D_RAMP_DELTA_PCT)
+			p->ui_boost_end_ns = time + RFX_D_UI_BOOST_NS;
+		p->prev_upct = upct;
+
+		ui_active = rfx_input_active(time) ||
+			    (p->ui_boost_end_ns && time < p->ui_boost_end_ns);
 
 		if (little) {
-			unsigned int cap = touch ?
-				rfx_pct(fmax, RFX_D_LITTLE_TOUCH_CAP_PCT) :
+			unsigned int cap = ui_active ?
+				rfx_pct(fmax, RFX_D_LITTLE_BOOST_CAP_PCT) :
 				rfx_pct(fmax, RFX_D_LITTLE_CAP_PCT);
 
 			if (freq > cap)
 				freq = cap;
-			if (touch) {
-				unsigned int fl = rfx_pct(fmax, RFX_D_LITTLE_TOUCH_PCT);
+			if (ui_active) {
+				unsigned int fl = rfx_pct(fmax, RFX_D_LITTLE_UI_FLOOR_PCT);
 
 				if (freq < fl)
 					freq = fl;
 			}
-		} else if (!prime && touch) {	/* Big touch floor */
-			unsigned int fl = rfx_pct(fmax, RFX_D_BIG_TOUCH_PCT);
+		} else if (!prime && ui_active) {	/* Big UI floor */
+			unsigned int fl = rfx_pct(fmax, RFX_D_BIG_UI_FLOOR_PCT);
 
 			if (freq < fl)
 				freq = fl;
@@ -1463,6 +1493,8 @@ static int rfx_start(struct cpufreq_policy *policy)
 	p->work_in_progress = false;
 	p->limits_changed = false;
 	p->need_freq_update = false;
+	p->prev_upct = 0;
+	p->ui_boost_end_ns = 0;
 	p->thermal_applied_pct = 100;
 	p->thermal_step_ns = now;
 
@@ -1570,4 +1602,4 @@ module_exit(vorpal_gov_exit);
 
 MODULE_AUTHOR(CPUFREQ_VORPAL_AUTHOR);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Vorpal CPUFreq Governor v6.0 - Gaming & Battery Optimized");
+MODULE_DESCRIPTION("Vorpal CPUFreq Governor v2.0");
