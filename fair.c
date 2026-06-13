@@ -8032,10 +8032,15 @@ static int task_hot(struct task_struct *p, struct lb_env *env)
 	 * them onto LITTLE as usual. Recently-run tasks also get a widened
 	 * cache-hot window to cut lobby migration churn. This is a bias, not a
 	 * hard pin (active balance can still move it), and reads only - KMI-safe.
+	 *
+	 * Threshold is src_cap >> 3 (~12.5%): per-cluster CPU telemetry showed
+	 * render threads being demoted onto LITTLE (LITTLE saturating 60-90%
+	 * while PRIME sat near-idle), so the isolation now catches moderately
+	 * heavy threads, keeping them on Big/Prime where the work belongs.
 	 */
 	if (sched_gaming_active) {
 		if (capacity_orig_of(env->dst_cpu) < capacity_orig_of(env->src_cpu) &&
-		    task_util(p) > (capacity_orig_of(env->src_cpu) >> 2))
+		    task_util(p) > (capacity_orig_of(env->src_cpu) >> 3))
 			return 1;
 		return delta < (s64)sysctl_sched_migration_cost * 2;
 	}
