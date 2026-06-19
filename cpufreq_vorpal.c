@@ -649,25 +649,35 @@ static void rfx_iowait_boost(struct rfx_cpu *rfx_c, u64 time, unsigned int flags
 	unsigned long max_cap;
 	unsigned int cap;
 
-	if (rfx_c->iowait_boost) {
-		if (!rfx_iowait_reset(rfx_c, time, set))
-			rfx_c->iowait_boost_pending = set;
-		return;
-	}
-	if (!set || rfx_c->iowait_boost_pending)
+	/* Reset the boost if the CPU appears to have been idle long enough. */
+	if (rfx_c->iowait_boost && rfx_iowait_reset(rfx_c, time, set))
 		return;
 
+	/* Only tasks waking up after IO get boosted. */
+	if (!set)
+		return;
+
+	/* Double the boost at most once per IO-wakeup request. */
+	if (rfx_c->iowait_boost_pending)
+		return;
 	rfx_c->iowait_boost_pending = true;
-	max_cap = arch_scale_cpu_capacity(rfx_c->cpu);
 
-	if (rfx_c->iowait_boost >= max_cap) {
-		cap = rfx_cap_is_little(max_cap) ? (SCHED_CAPACITY_SCALE / 6) :
-						   (SCHED_CAPACITY_SCALE * 3 / 4);
+	/*
+	 * Per-cluster boost ceiling: LITTLE is held low (support work), the
+	 * big/prime cluster may ramp to 3/4 capacity so a wake-from-IO burst
+	 * (e.g. in-game asset streaming) reaches a useful OPP immediately,
+	 * before PELT util catches up. Bounded, so it never pins the core.
+	 */
+	max_cap = arch_scale_cpu_capacity(rfx_c->cpu);
+	cap = rfx_cap_is_little(max_cap) ? (SCHED_CAPACITY_SCALE / 6) :
+					   (SCHED_CAPACITY_SCALE * 3 / 4);
+
+	/* Double the existing boost, else start at the minimum. */
+	if (rfx_c->iowait_boost)
 		rfx_c->iowait_boost = min_t(unsigned int,
 					    rfx_c->iowait_boost << 1, cap);
-		return;
-	}
-	rfx_c->iowait_boost = IOWAIT_BOOST_MIN;
+	else
+		rfx_c->iowait_boost = IOWAIT_BOOST_MIN;
 }
 
 static unsigned long rfx_iowait_apply(struct rfx_cpu *rfx_c, u64 time,
@@ -934,11 +944,13 @@ static const char * const rfx_skin_candidates[] = {
 	"skin-therm", "quiet-therm", "skin-msm-therm",
 	"xo-therm", "sys-therm", "board-therm",
 	/*
-	 * MediaTek board temperature sensor (skin-scale). Deliberately NOT
-	 * mtktscpu (CPU junction, 55-70C in play) / mtktsdctm (virtual CPU
-	 * zone) - binding either to the skin curve would throttle mid-match.
+	 * MediaTek board / skin NTC thermistors (skin-scale, ~38-48C). These
+	 * are physical board sensors - NOT the cpu, gpu or soc junction zones
+	 * (60-80C in play), which would throttle the skin curve mid-match.
+	 * ap_ntc (NTC beside the AP) is MTK's standard skin sensor;
+	 * backlight_therm (display NTC) is a close fallback.
 	 */
-	"mtkcsbts",
+	"ap_ntc", "backlight_therm", "mtkcsbts",
 };
 
 static void rfx_tz_autobind(void)
