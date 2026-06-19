@@ -1,6 +1,6 @@
 #
 # Automatically generated file; DO NOT EDIT.
-# Linux/arm64 5.10.253 1-5-LinuxStable Release Kernel Configuration
+# Linux/arm64 5.10.253 1-5-LinuxStable Kernel Configuration
 #
 CONFIG_CC_VERSION_TEXT="Android (7284624, based on r416183b) clang version 12.0.5 (https://android.googlesource.com/toolchain/llvm-project c935d99d7cf2016289302412d708641d52d2f7ee)"
 CONFIG_GCC_VERSION=0
@@ -5168,7 +5168,7 @@ CONFIG_STAGING=y
 #
 CONFIG_ASHMEM=y
 CONFIG_DEBUG_KINFO=y
-CONFIG_ION=y
+# CONFIG_ION is not set
 # end of Android
 
 # CONFIG_STAGING_BOARD is not set
@@ -6157,7 +6157,7 @@ CONFIG_KERNFS=y
 CONFIG_SYSFS=y
 CONFIG_TMPFS=y
 # CONFIG_TMPFS_POSIX_ACL is not set
-# CONFIG_TMPFS_XATTR is not set
+CONFIG_TMPFS_XATTR=y
 # CONFIG_TMPFS_INODE64 is not set
 # CONFIG_HUGETLBFS is not set
 CONFIG_MEMFD_CREATE=y
