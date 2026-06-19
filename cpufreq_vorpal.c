@@ -104,33 +104,29 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 
 /* ---- Gaming frequency band, percent of policy fmax ---- */
 /*
- * Prime: holds the render thread WHEN one is scheduled here. Telemetry from
- * real titles (Delta Force) shows the game often spreads its threads across
- * Big/Little and leaves Prime near-idle; a static high floor on an idle Prime
- * is pure waste heat with no FPS benefit. So the floor is ADAPTIVE: lock high
- * only once Prime is genuinely busy (util >= BUSY_ENTER), otherwise drop to a
- * lower idle floor that still recovers instantly (up-rate is 0 + headroom +
- * frame boost) the moment a heavy thread lands here.
+ * All gaming caps are 100% (= no artificial ceiling). With the double-headroom
+ * removed (see rfx_apply_headroom), the requested frequency now equals clean
+ * schedutil demand: light/medium frames request a low OPP and only a genuinely
+ * heavy frame reaches fmax, finishes fast and returns to idle (race-to-idle).
+ * A sub-100 cap would instead slow a saturated core, which RAISES load% at
+ * fixed work and starves frames - the opposite of "sustain". The floors below
+ * keep the cores warm/ready; the thermal step clamp is the real ceiling.
+ *
+ * Prime is a single-core cluster: the render thread hops in/out of it, so the
+ * floor is adaptive - locked high only while Prime is genuinely busy, dropped
+ * to a lower idle floor otherwise (up-rate is 0 so it snaps back instantly).
  */
 #define RFX_G_PRIME_FLOOR_PCT		90	/* busy: locked high */
 #define RFX_G_PRIME_IDLE_FLOOR_PCT	65	/* near-idle: save heat */
 #define RFX_G_PRIME_BUSY_ENTER_PCT	30
-#define RFX_G_PRIME_CAP_PCT		99
+#define RFX_G_PRIME_CAP_PCT		100
 #define RFX_G_PRIME_FRAME_PCT		95
-/*
- * Big: in practice this cluster carries most of the game load. A cap of 90%
- * made it saturate (load 80%+) and starve frames; raised to 96% so the cores
- * that actually do the work have headroom -> load drops, frames land on time.
- */
+/* Big: carries most of the game load - flat floor keeps it warm, no cap. */
 #define RFX_G_BIG_FLOOR_PCT		80
-#define RFX_G_BIG_CAP_PCT		96
+#define RFX_G_BIG_CAP_PCT		100
 #define RFX_G_BIG_FRAME_PCT		92
-/*
- * Little: kept dynamic, but it too gets overloaded by render work, so its cap
- * is raised (85->95) to stop the 60-90% saturation that telemetry showed, and
- * it now honours the frame-miss boost.
- */
-#define RFX_G_LITTLE_CAP_PCT		95
+/* Little: dynamic support work - soft floor only when busy, no cap. */
+#define RFX_G_LITTLE_CAP_PCT		100
 #define RFX_G_LITTLE_FLOOR_PCT		42
 #define RFX_G_LITTLE_FLOOR_ENTER_PCT	20
 #define RFX_G_LITTLE_FRAME_PCT		80
@@ -173,25 +169,38 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 #define RFX_EMA_UP_SHIFT_GAMING		1	/* react fast to a demand rise */
 #define RFX_EMA_DN_SHIFT_GAMING		3	/* decay slowly -> anti-jitter */
 
-/* ---- Headroom (extra capacity above demand) percent ---- */
-#define RFX_HEADROOM_GAMING_BIG		25
-#define RFX_HEADROOM_GAMING_LITTLE	15
+/*
+ * ---- Headroom ----
+ * Gaming adds NO governor-side headroom: rfx_get_util_gki510() already applies
+ * the standard 25% DVFS headroom. Daily uses a small tiered top-up (hardcoded
+ * shifts in rfx_apply_headroom) that adds little at low util (battery) and more
+ * as util climbs (responsiveness).
+ */
 
 /* ---- Thermal step controller ---- */
 #define RFX_THERMAL_STEP_NS		(6 * NSEC_PER_MSEC)
 #define RFX_THERMAL_STEP_DOWN_PCT	2
 #define RFX_THERMAL_STEP_UP_PCT		1
-#define RFX_THERMAL_MIN_CAP_PCT		50
+#define RFX_THERMAL_MIN_CAP_PCT		70
 #define RFX_THERMAL_POLL_GAMING_MS	50
 #define RFX_THERMAL_POLL_IDLE_MS	200
 /*
- * Temperature breakpoints (milli-Celsius) -> target cap percent. GREEN raised
- * 38->40 so the cap stays at 100% through normal gameplay temps; throttling
- * that starts too early is felt as the residual jitter under load.
+ * Temperature breakpoints (milli-Celsius) -> target cap percent, tuned for a
+ * SKIN / board sensor (bind one via the thermal_zone sysfs). The goal is a
+ * gentle pre-emptive shave that begins BEFORE the vendor step_wise governor
+ * reaches its hard policy->max trip, so heat is bled off smoothly instead of in
+ * FPS-crashing slams: stay 100% through normal gameplay (< GREEN), a shallow
+ * -2%/C up to YELLOW, a firmer -3%/C up to RED, then hold the floor and let the
+ * vendor framework handle any genuine emergency beyond. The floor is high (75%)
+ * and RFX_THERMAL_MIN_CAP_PCT guards it, so a heavy frame always has clock to
+ * land on - this is a smoother, not a deeper, throttle than the vendor's.
+ *
+ * NOTE: SKIN-scale values. Do NOT bind a CPU-junction sensor here - it reads
+ * 50-70C in normal play and would throttle mid-match (the v6.11 regression).
  */
-#define RFX_TEMP_GREEN_MC		40000
-#define RFX_TEMP_YELLOW_MC		43000
-#define RFX_TEMP_RED_MC			45000
+#define RFX_TEMP_GREEN_MC		42000	/* start gentle shave */
+#define RFX_TEMP_YELLOW_MC		47000	/* -2%/C below, -3%/C above */
+#define RFX_TEMP_RED_MC			52000	/* floor reached; vendor beyond */
 
 /* ---- Frame pacing ---- */
 #define RFX_FRAME_BUDGET_US_120		8333	/* 1e6/120 */
@@ -377,8 +386,10 @@ static unsigned long rfx_ema(unsigned long old, unsigned long val, bool gaming)
 /*
  * Headroom: request slightly more capacity than measured so we land on an OPP
  * with room to spare (avoids running pinned at 100% util, which is both a
- * latency and a load-percent problem). Gaming uses a flat generous headroom;
- * daily uses a tiered curve that adds little at low util (battery) and more as
+ * latency and a load-percent problem). Gaming adds nothing here - the util
+ * getter already applied the 25% DVFS headroom, and double-counting it would
+ * push moderate frames to fmax/top-OPP (heat -> throttle -> frame drops).
+ * Daily uses a tiered curve that adds little at low util (battery) and more as
  * util climbs (responsiveness).
  */
 static unsigned long rfx_apply_headroom(unsigned long util, unsigned long max_cap,
@@ -389,15 +400,13 @@ static unsigned long rfx_apply_headroom(unsigned long util, unsigned long max_ca
 	if (!max_cap || util >= max_cap)
 		return max_cap;
 
+	/* Gaming: util is already headroomed by the getter - pass through. */
+	if (gaming)
+		return util;
+
 	upct = (unsigned int)(util * 100 / max_cap);
 	if (upct >= 95)
 		return max_cap;
-
-	if (gaming) {
-		unsigned int h = little ? RFX_HEADROOM_GAMING_LITTLE :
-					  RFX_HEADROOM_GAMING_BIG;
-		return min(util + util * h / 100, max_cap);
-	}
 
 	if (little) {
 		if (upct >= 70)
@@ -423,11 +432,11 @@ static int rfx_temp_to_cap(int t_mc)
 {
 	if (t_mc < RFX_TEMP_GREEN_MC)
 		return 100;
-	if (t_mc < RFX_TEMP_YELLOW_MC)			/* -5%/C */
-		return 100 - (t_mc - RFX_TEMP_GREEN_MC) * 5 / 1000;
-	if (t_mc < RFX_TEMP_RED_MC)			/* -10%/C */
-		return 80 - (t_mc - RFX_TEMP_YELLOW_MC) * 10 / 1000;
-	return 60;
+	if (t_mc < RFX_TEMP_YELLOW_MC)			/* -2%/C -> 90 @ YELLOW */
+		return 100 - (t_mc - RFX_TEMP_GREEN_MC) * 2 / 1000;
+	if (t_mc < RFX_TEMP_RED_MC)			/* -3%/C, continuous from 90 */
+		return 90 - (t_mc - RFX_TEMP_YELLOW_MC) * 3 / 1000;
+	return 75;
 }
 
 /*
@@ -474,7 +483,12 @@ static unsigned int rfx_thermal_clamp(struct rfx_policy *p, unsigned int freq,
  */
 static void rfx_frame_account(u64 time)
 {
-	unsigned int ft = atomic_read(&rfx_frame_time_us);
+	/*
+	 * Consume the posted frame exactly once. The fast path runs at >300Hz,
+	 * far faster than the frame rate, so a plain read would count the same
+	 * frame many times (skewing jank% and re-arming the boost every update).
+	 */
+	unsigned int ft = atomic_xchg(&rfx_frame_time_us, 0);
 	unsigned int bud = atomic_read(&rfx_frame_budget_us);
 
 	if (!ft || !bud)
@@ -903,6 +917,62 @@ static void rfx_irq_work(struct irq_work *irq_work)
 #ifdef CONFIG_THERMAL
 static struct thermal_zone_device *rfx_tz;
 static char rfx_tz_name[THERMAL_NAME_LENGTH];
+static bool rfx_tz_user_set;		/* a manual thermal_zone write wins */
+static int rfx_tz_tries;		/* bound the auto-bind probing */
+#define RFX_TZ_MAX_TRIES	60
+
+/*
+ * Curated SKIN / board sensor names for gaming auto-bind. NEVER list a
+ * CPU-junction zone here - those read 50-70C in normal play and would throttle
+ * mid-match (the v6.11 regression). On gaming_mode=1 the poller lazily binds the
+ * first of these that exists, so heavy/long sessions get the smooth pre-emptive
+ * thermal shave with no manual setup. If a device's skin zone is not in this
+ * list, write its name (or "auto") to the thermal_zone sysfs instead.
+ */
+static const char * const rfx_skin_candidates[] = {
+	/* Qualcomm / generic skin + board sensors. */
+	"skin-therm", "quiet-therm", "skin-msm-therm",
+	"xo-therm", "sys-therm", "board-therm",
+	/*
+	 * MediaTek board temperature sensor (skin-scale). Deliberately NOT
+	 * mtktscpu (CPU junction, 55-70C in play) / mtktsdctm (virtual CPU
+	 * zone) - binding either to the skin curve would throttle mid-match.
+	 */
+	"mtkcsbts",
+};
+
+static void rfx_tz_autobind(void)
+{
+	int i;
+
+	if (rfx_tz || rfx_tz_user_set || rfx_tz_tries >= RFX_TZ_MAX_TRIES)
+		return;
+	rfx_tz_tries++;
+
+	for (i = 0; i < ARRAY_SIZE(rfx_skin_candidates); i++) {
+		struct thermal_zone_device *tz =
+			thermal_zone_get_zone_by_name(rfx_skin_candidates[i]);
+
+		if (!IS_ERR(tz)) {
+			strscpy(rfx_tz_name, rfx_skin_candidates[i],
+				sizeof(rfx_tz_name));
+			rfx_tz = tz;
+			pr_info("vorpal: auto-bound skin thermal zone '%s'\n",
+				rfx_tz_name);
+			return;
+		}
+	}
+}
+
+/* Drop an auto-bound zone on gaming-off; a manual bind is kept. */
+static void rfx_tz_release_auto(void)
+{
+	if (!rfx_tz_user_set) {
+		rfx_tz = NULL;
+		rfx_tz_name[0] = '\0';
+		rfx_tz_tries = 0;
+	}
+}
 #endif
 static struct delayed_work rfx_thermal_work;
 static u64 rfx_jank_window_start;
@@ -916,7 +986,14 @@ static void rfx_thermal_fn(struct work_struct *w)
 	u64 now = ktime_get_ns();
 
 #ifdef CONFIG_THERMAL
-	if (rfx_tz && !thermal_zone_get_temp(rfx_tz, &t_mc))
+	struct thermal_zone_device *tz;
+
+	/* Lazily bind a skin zone while gaming (rides out late driver reg). */
+	if (rfx_gaming_enabled())
+		rfx_tz_autobind();
+
+	tz = rfx_tz;			/* snapshot: gaming-off may clear it */
+	if (tz && !thermal_zone_get_temp(tz, &t_mc))
 		have = true;
 #endif
 	if (!have) {
@@ -1118,11 +1195,19 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 		atomic_set(&rfx_janks_seen, 0);
 		atomic_set(&rfx_jank_pct, 0);
 		rfx_reset_all_policies();
+#ifdef CONFIG_THERMAL
+		/* Unbind the auto-bound skin zone -> back to (none) for daily. */
+		rfx_tz_release_auto();
+#endif
 	} else {
 		/* Default the budget to 120fps unless userspace set it. */
 		if (!atomic_read(&rfx_frame_budget_us))
 			atomic_set(&rfx_frame_budget_us, RFX_FRAME_BUDGET_US_120);
-		/* Sample temperature sooner once gaming begins. */
+#ifdef CONFIG_THERMAL
+		/* Re-probe the skin zone for this session (driver may be late). */
+		rfx_tz_tries = 0;
+#endif
+		/* Sample temperature sooner once gaming begins (also auto-binds). */
 		mod_delayed_work(system_wq, &rfx_thermal_work,
 				 msecs_to_jiffies(RFX_THERMAL_POLL_GAMING_MS));
 	}
@@ -1163,11 +1248,22 @@ static ssize_t thermal_zone_store(struct gov_attr_set *attr_set,
 
 	strscpy(name, buf, sizeof(name));
 	strim(name);
+
+	/* "auto" hands control back to the gaming skin-zone auto-bind. */
+	if (!strcmp(name, "auto")) {
+		rfx_tz_user_set = false;
+		rfx_tz = NULL;
+		rfx_tz_name[0] = '\0';
+		rfx_tz_tries = 0;
+		return count;
+	}
+
 	tz = thermal_zone_get_zone_by_name(name);
 	if (IS_ERR(tz))
 		return -EINVAL;
 	rfx_tz = tz;
 	strscpy(rfx_tz_name, name, sizeof(rfx_tz_name));
+	rfx_tz_user_set = true;		/* manual choice overrides auto-bind */
 	return count;
 #else
 	return -ENODEV;
