@@ -166,7 +166,7 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 /* ---- Util EMA (directional smoothing). new>old: up_shift, else down_shift ---- */
 #define RFX_EMA_UP_SHIFT_DAILY		1	/* rise fast: kill PELT-lag stutter */
 #define RFX_EMA_DN_SHIFT_DAILY		3	/* decay gently: no inter-frame sag */
-#define RFX_EMA_UP_SHIFT_GAMING		1	/* react fast to a demand rise */
+#define RFX_EMA_UP_SHIFT_GAMING		0	/* instant attack: no lag on a render spike */
 #define RFX_EMA_DN_SHIFT_GAMING		3	/* decay slowly -> anti-jitter */
 
 /*
@@ -198,9 +198,17 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * NOTE: SKIN-scale values. Do NOT bind a CPU-junction sensor here - it reads
  * 50-70C in normal play and would throttle mid-match (the v6.11 regression).
  */
-#define RFX_TEMP_GREEN_MC		42000	/* start gentle shave */
-#define RFX_TEMP_YELLOW_MC		47000	/* -2%/C below, -3%/C above */
-#define RFX_TEMP_RED_MC			52000	/* floor reached; vendor beyond */
+/*
+ * Breakpoints sit ABOVE the device's normal gaming skin temp (benchmarks show
+ * ap_ntc peaks ~45-47C in a long PUBG session). Keeping GREEN at 48C means the
+ * cap stays 100% through all normal play - so the governor does NOT shave a
+ * healthy frame (an over-early shave was measured to raise jank ~1.9% -> ~3%).
+ * The gentle -2/-3%/C ramp only engages past 48C as a pre-emptive safety net,
+ * bleeding heat smoothly before the vendor step_wise governor's hard slam.
+ */
+#define RFX_TEMP_GREEN_MC		48000	/* hold 100% through normal play */
+#define RFX_TEMP_YELLOW_MC		52000	/* -2%/C below, -3%/C above */
+#define RFX_TEMP_RED_MC			56000	/* floor reached; vendor beyond */
 
 /* ---- Frame pacing ---- */
 #define RFX_FRAME_BUDGET_US_120		8333	/* 1e6/120 */
