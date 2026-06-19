@@ -4764,7 +4764,7 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 	/*
          * Gaming mode: reduce ideal runtime for background tasks
          */
-        if (unlikely(sched_gaming_active)) {
+        if (unlikely(sched_gaming_active && entity_is_task(curr))) {
                 struct task_struct *p = task_of(curr);
                 if (p->static_prio > DEFAULT_PRIO &&
                     delta_exec > ideal_runtime / 2)
@@ -7389,6 +7389,14 @@ balance_fair(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 static unsigned long wakeup_gran(struct sched_entity *se)
 {
 	unsigned long gran = sysctl_sched_wakeup_granularity;
+
+	/*
+	 * Gaming mode: shrink the wake-up granularity so a freshly woken
+	 * render / game thread preempts the current task sooner. Lower wake-up
+	 * latency on the render thread = fewer late frames = less micro-stutter.
+	 */
+	if (unlikely(sched_gaming_active) && gran > GAMING_WAKEUP_GRANULARITY_NS)
+		gran = GAMING_WAKEUP_GRANULARITY_NS;
 
 	/*
 	 * Since its curr running now, convert the gran from real-time
