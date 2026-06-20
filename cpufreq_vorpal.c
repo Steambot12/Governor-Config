@@ -125,10 +125,17 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 #define RFX_G_BIG_FLOOR_PCT		80
 #define RFX_G_BIG_CAP_PCT		100
 #define RFX_G_BIG_FRAME_PCT		92
-/* Little: dynamic support work - soft floor only when busy, no cap. */
+/*
+ * Little: support work, no cap. A latency-sensitive game worker stuck on a
+ * 600MHz LITTLE finishes ~3x slower than at mid OPP and can land a frame late,
+ * so during gaming LITTLE holds a mid-range floor (~1.2GHz) instead of dropping
+ * to fmin. The ENTER gate is low (12%) so only a genuinely idle LITTLE sleeps
+ * down - this kills the frequent 600MHz crashes seen under load while the huge
+ * thermal headroom (skin ~37C, ~5.4W) easily absorbs the extra LITTLE power.
+ */
 #define RFX_G_LITTLE_CAP_PCT		100
-#define RFX_G_LITTLE_FLOOR_PCT		42
-#define RFX_G_LITTLE_FLOOR_ENTER_PCT	20
+#define RFX_G_LITTLE_FLOOR_PCT		65	/* ~1.2GHz mid OPP (was 42 = ~750MHz) */
+#define RFX_G_LITTLE_FLOOR_ENTER_PCT	12	/* apply floor unless near-idle */
 #define RFX_G_LITTLE_FRAME_PCT		80
 
 /* ---- Daily frequency shaping, percent of policy fmax ---- */
