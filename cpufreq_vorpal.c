@@ -117,14 +117,32 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * to a lower idle floor otherwise (up-rate is 0 so it snaps back instantly).
  */
 #define RFX_G_PRIME_FLOOR_PCT		90	/* busy: locked high */
-#define RFX_G_PRIME_IDLE_FLOOR_PCT	65	/* near-idle: save heat */
-#define RFX_G_PRIME_BUSY_ENTER_PCT	30
+#define RFX_G_PRIME_IDLE_FLOOR_PCT	78	/* idle: stay warm (~2.3GHz) - skin runs cool (ap_ntc ~40C), so a higher idle floor keeps Prime ready for an incoming render thread and kills the cold-start dip, with no thermal risk */
+#define RFX_G_PRIME_BUSY_ENTER_PCT	20	/* latch busy-hold on light activity too: a bursty render thread (Delta Force) then lands on a WARM Prime (busy floor) instead of the 2400 idle floor - fixes the cold-start dip + the inter-burst sag. Safe: Prime is a single core, so the extra warmth is bounded to one CPU (unlike the 3-core Big, which overheated) */
 #define RFX_G_PRIME_CAP_PCT		100
 #define RFX_G_PRIME_FRAME_PCT		95
-/* Big: carries most of the game load - flat floor keeps it warm, no cap. */
-#define RFX_G_BIG_FLOOR_PCT		80
+/*
+ * Busy-hold hysteresis: once Prime is busy, keep it locked at the high floor
+ * for this long after the last busy sample. A bursty game thread (Delta Force)
+ * pulses Prime load above/below BUSY_ENTER; without a hold the floor toggled
+ * down into every inter-burst gap, oscillating Prime 2.0<->3.0GHz (frame-time
+ * + power spikes). The hold bridges those gaps so Prime stays steady; only a
+ * genuinely parked Prime (idle past the hold) relaxes to the idle floor.
+ */
+#define RFX_G_PRIME_HOLD_NS		(150 * NSEC_PER_MSEC)
+/*
+ * Big: the render thread lives mostly HERE, but a HIGH flat floor backfires -
+ * 3 Big cores pinned high run hot, and on this device that heat trips the VENDOR
+ * step_wise thermal governor (cap_pct stays 100, so it is not us), which slams
+ * policy->max -> freq forced below demand -> load spikes ~98% -> FPS drop. So a
+ * floor of 92% measured WORSE than 85%. The right model after the double-headroom
+ * fix is race-to-idle: a moderate floor (anti-sag only) + instant EMA attack +
+ * zero up-rate, so Big jumps to fmax on a real demand spike and idles between =
+ * coolest, stays under the vendor trip, sustains FPS. 85% is the cool-stable edge.
+ */
+#define RFX_G_BIG_FLOOR_PCT		85	/* ~2.0GHz anti-sag; race-to-idle does the rest */
 #define RFX_G_BIG_CAP_PCT		100
-#define RFX_G_BIG_FRAME_PCT		92
+#define RFX_G_BIG_FRAME_PCT		92	/* >floor: lift on a frame miss (if a feeder runs) */
 /*
  * Little: support work, no cap. A latency-sensitive game worker stuck on a
  * 600MHz LITTLE finishes ~3x slower than at mid OPP and can land a frame late,
@@ -134,9 +152,17 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * thermal headroom (skin ~37C, ~5.4W) easily absorbs the extra LITTLE power.
  */
 #define RFX_G_LITTLE_CAP_PCT		100
-#define RFX_G_LITTLE_FLOOR_PCT		65	/* ~1.2GHz mid OPP (was 42 = ~750MHz) */
+#define RFX_G_LITTLE_FLOOR_PCT		58	/* ~1.05GHz mid OPP - above the 600MHz cliff, cooler than 65 */
 #define RFX_G_LITTLE_FLOOR_ENTER_PCT	12	/* apply floor unless near-idle */
 #define RFX_G_LITTLE_FRAME_PCT		80
+/*
+ * LITTLE busy-hold: same hysteresis idea as Prime, tuned separately. A momentary
+ * util dip below FLOOR_ENTER used to drop the floor and let LITTLE crash to fmin
+ * (600MHz) mid-gaming - a latency-sensitive worker landing there then stalled.
+ * Holding the floor for this long after the last busy sample bridges the
+ * micro-idle gaps so LITTLE stays on its ~1.2GHz floor through gameplay.
+ */
+#define RFX_G_LITTLE_HOLD_NS		(80 * NSEC_PER_MSEC)
 
 /* ---- Daily frequency shaping, percent of policy fmax ---- */
 /*
@@ -145,7 +171,18 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * get a responsiveness floor so animations / captions / scrolls do not run at
  * a starved OPP. When idle, LITTLE is capped low for battery.
  */
-#define RFX_D_LITTLE_CAP_PCT		65	/* battery: cap LITTLE (was 55) */
+/*
+ * Daily LITTLE idle cap. The old 65% starved UI work that the "UI-active"
+ * heuristic missed - a non-touch burst that rises GRADUALLY (a smooth animation,
+ * a video subtitle redraw, sustained moderate-util drawing) never trips the
+ * touch window or the >=12% ramp, so LITTLE stayed pinned at 65% -> stutter,
+ * while touch/sharp bursts got boosted -> smooth. That is the "sometimes smooth,
+ * sometimes not" daily UI. Raising the cap to 78% removes that starvation
+ * ceiling for undetected work. Battery cost is ~nil: the cap only bites when
+ * LITTLE util is genuinely high (real work); at true idle, util-following keeps
+ * the freq low regardless of the cap. UI-active still relaxes further to 90%.
+ */
+#define RFX_D_LITTLE_CAP_PCT		78	/* idle cap (was 65): stop starving undetected UI bursts */
 #define RFX_D_LITTLE_BOOST_CAP_PCT	90	/* relax cap while UI active */
 #define RFX_D_LITTLE_UI_FLOOR_PCT	58	/* LITTLE floor while UI active */
 #define RFX_D_BIG_UI_FLOOR_PCT		55	/* Big floor while UI active */
@@ -314,6 +351,8 @@ struct rfx_policy {
 
 	unsigned int prev_upct;		/* last util%, for daily ramp detect */
 	u64 ui_boost_end_ns;		/* daily: UI render-burst floor hold */
+	u64 prime_busy_hold_ns;		/* gaming: hold Prime high across burst gaps */
+	u64 little_busy_hold_ns;	/* gaming: hold LITTLE floor across micro-idle */
 
 	int thermal_applied_pct;	/* walked toward rfx_thermal_cap_pct */
 	u64 thermal_step_ns;
@@ -558,14 +597,25 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 
 		if (prime) {
 			/*
-			 * Adaptive floor: only lock Prime high once it is doing
-			 * real work, so a game that parks its threads elsewhere
-			 * does not leave Prime burning power at 90% for nothing.
+			 * Adaptive floor + busy-hold hysteresis. Lock Prime high
+			 * while busy and KEEP it locked for RFX_G_PRIME_HOLD_NS
+			 * after the last busy sample, so a bursty game thread does
+			 * not let the floor toggle down into the inter-burst gaps
+			 * (that toggling oscillated Prime 2.0<->3.0GHz). Only a
+			 * genuinely parked Prime relaxes to the idle floor.
 			 */
-			unsigned int fl = (upct >= RFX_G_PRIME_BUSY_ENTER_PCT) ?
-				rfx_pct(fmax, RFX_G_PRIME_FLOOR_PCT) :
-				rfx_pct(fmax, RFX_G_PRIME_IDLE_FLOOR_PCT);
-			unsigned int cap = rfx_pct(fmax, RFX_G_PRIME_CAP_PCT);
+			bool busy;
+			unsigned int fl, cap;
+
+			if (upct >= RFX_G_PRIME_BUSY_ENTER_PCT)
+				p->prime_busy_hold_ns = time + RFX_G_PRIME_HOLD_NS;
+			busy = (upct >= RFX_G_PRIME_BUSY_ENTER_PCT) ||
+			       (p->prime_busy_hold_ns &&
+				time < p->prime_busy_hold_ns);
+
+			fl = busy ? rfx_pct(fmax, RFX_G_PRIME_FLOOR_PCT) :
+				    rfx_pct(fmax, RFX_G_PRIME_IDLE_FLOOR_PCT);
+			cap = rfx_pct(fmax, RFX_G_PRIME_CAP_PCT);
 
 			if (fboost)
 				fl = max(fl, rfx_pct(fmax, RFX_G_PRIME_FRAME_PCT));
@@ -586,8 +636,16 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 		} else {			/* Little: dynamic, soft floor */
 			unsigned int cap = rfx_pct(fmax, RFX_G_LITTLE_CAP_PCT);
 			unsigned int fl = 0;
+			bool busy;
 
+			/* Busy-hold: bridge micro-idle so we don't crash to fmin. */
 			if (upct > RFX_G_LITTLE_FLOOR_ENTER_PCT)
+				p->little_busy_hold_ns = time + RFX_G_LITTLE_HOLD_NS;
+			busy = (upct > RFX_G_LITTLE_FLOOR_ENTER_PCT) ||
+			       (p->little_busy_hold_ns &&
+				time < p->little_busy_hold_ns);
+
+			if (busy)
 				fl = rfx_pct(fmax, RFX_G_LITTLE_FLOOR_PCT);
 			if (fboost)
 				fl = max(fl, rfx_pct(fmax, RFX_G_LITTLE_FRAME_PCT));
@@ -1003,6 +1061,7 @@ static void rfx_tz_release_auto(void)
 #endif
 static struct delayed_work rfx_thermal_work;
 static u64 rfx_jank_window_start;
+static int rfx_temp_smoothed = -1;	/* EMA of the sensor, -1 = unset */
 
 static void rfx_thermal_fn(struct work_struct *w)
 {
@@ -1029,7 +1088,24 @@ static void rfx_thermal_fn(struct work_struct *w)
 			have = true;
 	}
 
-	atomic_set(&rfx_thermal_cap_pct, have ? rfx_temp_to_cap(t_mc) : 100);
+	/*
+	 * Smooth the raw sensor with an EMA (alpha 0.25) before mapping to a cap.
+	 * A bare sensor dithers ~+/-0.5C; when it sits near a breakpoint that
+	 * dither would flip the published cap (e.g. 100<->98) every poll, and the
+	 * fast-path step controller would chase it up and down -> a sawtooth on
+	 * the clamped freq = visible jitter right at the throttle knee. Filtering
+	 * the temperature publishes a steady cap, so the throttle stays smooth.
+	 */
+	if (have) {
+		if (rfx_temp_smoothed < 0)
+			rfx_temp_smoothed = t_mc;
+		else
+			rfx_temp_smoothed += (t_mc - rfx_temp_smoothed) >> 2;
+		atomic_set(&rfx_thermal_cap_pct, rfx_temp_to_cap(rfx_temp_smoothed));
+	} else {
+		rfx_temp_smoothed = -1;
+		atomic_set(&rfx_thermal_cap_pct, 100);
+	}
 
 	/* Jank window: publish jank percent roughly every RFX_JANK_WINDOW_NS. */
 	if (!rfx_jank_window_start)
@@ -1336,6 +1412,18 @@ static ssize_t jank_pct_show(struct gov_attr_set *attr_set, char *buf)
 }
 static struct governor_attr jank_pct = __ATTR_RO(jank_pct);
 
+/*
+ * RO diagnostic: the thermal cap the governor is currently publishing (percent
+ * of fmax). 100 = not throttling. If a cluster's freq sags while this reads
+ * <100, the governor thermal step is the cause (raise the breakpoints / check
+ * the bound zone scale); if it reads 100, the sag is util-following / placement.
+ */
+static ssize_t cap_pct_show(struct gov_attr_set *attr_set, char *buf)
+{
+	return sprintf(buf, "%d\n", atomic_read(&rfx_thermal_cap_pct));
+}
+static struct governor_attr cap_pct = __ATTR_RO(cap_pct);
+
 static struct attribute *rfx_little_attrs[] = {
 	&rate_limit_us.attr,
 	&up_rate_limit_us.attr,
@@ -1362,6 +1450,7 @@ static struct attribute *rfx_prime_attrs[] = {
 	&frame_budget_us.attr,
 	&frame_time_us.attr,
 	&jank_pct.attr,
+	&cap_pct.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(rfx_prime);
@@ -1618,6 +1707,8 @@ static int rfx_start(struct cpufreq_policy *policy)
 	p->need_freq_update = false;
 	p->prev_upct = 0;
 	p->ui_boost_end_ns = 0;
+	p->prime_busy_hold_ns = 0;
+	p->little_busy_hold_ns = 0;
 	p->thermal_applied_pct = 100;
 	p->thermal_step_ns = now;
 
