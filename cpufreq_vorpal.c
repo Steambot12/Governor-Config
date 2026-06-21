@@ -131,6 +131,14 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  */
 #define RFX_G_PRIME_HOLD_NS		(150 * NSEC_PER_MSEC)
 /*
+ * Cold-start warmup: for this long after gaming_mode=1, Prime is treated as busy
+ * so it starts at the high floor. At match load the render thread is not yet
+ * established (util low) -> without this Prime sits at the 2400 idle floor and
+ * the first frames land on a cold core (the recurring start-of-match dip). One
+ * single core held high for a few seconds = negligible heat.
+ */
+#define RFX_G_PRIME_WARMUP_NS		(3000 * NSEC_PER_MSEC)
+/*
  * Big: the render thread lives mostly HERE, but a HIGH flat floor backfires -
  * 3 Big cores pinned high run hot, and on this device that heat trips the VENDOR
  * step_wise thermal governor (cap_pct stays 100, so it is not us), which slams
@@ -208,7 +216,7 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 #define RFX_INPUT_WINDOW_NS		(220 * NSEC_PER_MSEC)
 
 /* ---- Util EMA (directional smoothing). new>old: up_shift, else down_shift ---- */
-#define RFX_EMA_UP_SHIFT_DAILY		1	/* rise fast: kill PELT-lag stutter */
+#define RFX_EMA_UP_SHIFT_DAILY		0	/* instant attack: a render-thread burst (texture upload / compositing) gets clock immediately -> shorter RT spike -> less daily frame-time jitter. Decay stays slow (down-shift 3), so ~no battery cost */
 #define RFX_EMA_DN_SHIFT_DAILY		3	/* decay gently: no inter-frame sag */
 #define RFX_EMA_UP_SHIFT_GAMING		0	/* instant attack: no lag on a render spike */
 #define RFX_EMA_DN_SHIFT_GAMING		3	/* decay slowly -> anti-jitter */
@@ -301,6 +309,9 @@ static atomic_t rfx_jank_pct = ATOMIC_INIT(0);
  * Prime/Big/Little lift their floor together until this deadline.
  */
 static atomic64_t rfx_frame_boost_end_ns = ATOMIC64_INIT(0);
+
+/* Deadline until which Prime is force-held high after gaming starts (cold-start). */
+static atomic64_t rfx_gaming_warmup_end_ns = ATOMIC64_INIT(0);
 
 /* All live policies, so gaming-off can reset every cluster (not just Prime). */
 static LIST_HEAD(rfx_policy_list);
@@ -611,7 +622,8 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 				p->prime_busy_hold_ns = time + RFX_G_PRIME_HOLD_NS;
 			busy = (upct >= RFX_G_PRIME_BUSY_ENTER_PCT) ||
 			       (p->prime_busy_hold_ns &&
-				time < p->prime_busy_hold_ns);
+				time < p->prime_busy_hold_ns) ||
+			       time < (u64)atomic64_read(&rfx_gaming_warmup_end_ns);
 
 			fl = busy ? rfx_pct(fmax, RFX_G_PRIME_FLOOR_PCT) :
 				    rfx_pct(fmax, RFX_G_PRIME_IDLE_FLOOR_PCT);
@@ -1298,6 +1310,7 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 		atomic_set(&rfx_janks_seen, 0);
 		atomic_set(&rfx_jank_pct, 0);
 		rfx_reset_all_policies();
+		atomic64_set(&rfx_gaming_warmup_end_ns, 0);
 #ifdef CONFIG_THERMAL
 		/* Unbind the auto-bound skin zone -> back to (none) for daily. */
 		rfx_tz_release_auto();
@@ -1306,6 +1319,9 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 		/* Default the budget to 120fps unless userspace set it. */
 		if (!atomic_read(&rfx_frame_budget_us))
 			atomic_set(&rfx_frame_budget_us, RFX_FRAME_BUDGET_US_120);
+		/* Pre-warm Prime so the first frames don't land on a cold core. */
+		atomic64_set(&rfx_gaming_warmup_end_ns,
+			     ktime_get_ns() + RFX_G_PRIME_WARMUP_NS);
 #ifdef CONFIG_THERMAL
 		/* Re-probe the skin zone for this session (driver may be late). */
 		rfx_tz_tries = 0;
