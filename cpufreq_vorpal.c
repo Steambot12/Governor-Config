@@ -287,22 +287,31 @@ static atomic64_t drm_last_present_ns = ATOMIC64_INIT(0);
 
 /* ---- Frame pacing ---- */
 #define RFX_FRAME_BUDGET_US_120		8333	/* 1e6/120 */
+#define RFX_FRAME_BUDGET_US_100		10000	/* 1e6/100 */
 #define RFX_FRAME_BUDGET_US_90		11111	/* 1e6/90  */
 /*
- * Default gaming frame budget = 90fps. This is the PROVEN-STABLE value (28-min
- * PUBG: jank 1.7%, min 74.9, avg 117.7, 46.5C, 5.86W). Setting it to 120fps was
- * measured to be MUCH WORSE: at 8333us the proactive-sustain arms the instant
- * frame time slides past ~8.83ms (~113fps), i.e. for the whole 113-120 band, so
- * on a device already near its thermal envelope it chased every shallow sag ->
- * extra clock -> faster junction climb -> earlier vendor throttle -> MORE drops.
- * The recurring wall: pushing the governor to defend 120 harder costs more heat
- * than it gives. At 11111us/90fps the sustain stays dormant through normal 120fps
- * play (frames look on-time vs the larger budget) so the clock races-to-idle and
- * stays cool; it only wakes for a genuinely deep sag (< ~85fps). The remaining
- * shallow drops on this build are single heavy frames near the cpufreq floor -
- * the real lever for fully removing them is the in-game FPS cap, not the budget.
- * Userspace can still pin any value via the frame_budget_us sysfs (a middle 100fps
- * = echo 10000 catches the deeper sags without the 120-budget heat, if wanted).
+ * Default gaming frame budget = 90fps. THE PROVEN-BEST value (28-min PUBG: jank
+ * 1.7%, min 74.9, avg 117.7, 46.5C, 5.86W). Set deliberately ABOVE the render
+ * target's frame time so the proactive-sustain stays DORMANT through normal 120fps
+ * play: it arms only below ~85fps, so the clusters race-to-idle in the healthy band
+ * = cool + low power, which is exactly why this config wins.
+ *
+ * Both "tighter" budgets were MEASURED to regress - on this device ANY in-band
+ * sustain activation trades a little smoothness for more heat/power and ends up
+ * WORSE overall:
+ *   - 120fps (8333us): arms across the whole 113-120 band -> chases every shallow
+ *     sag -> faster junction climb -> vendor throttle -> MORE drops ("sangat parah").
+ *   - 100fps (10000us): arms ~94fps -> woke the boost on the 90-110 sags -> power up
+ *     to 6.18W, jank 1.7%->2.7%, early drops to 71.5 (the boost activity itself added
+ *     instability/heat). Measured WORSE than leaving it dormant.
+ * Lesson (final, do NOT relitigate): the sustain budget must sit at/below the
+ * device's sustainable FPS so the controller stays dormant; defending 120 harder via
+ * the budget always costs more than it gives here. The residual shallow drops are
+ * single heavy frames / capacity saturation near the floor - the only real lever
+ * left is the in-game FPS cap, NOT a tighter governor budget.
+ *
+ * Still sysfs-overridable: `echo 10000|8333 > .../vorpal/frame_budget_us` pins
+ * 100/120 (sets rfx_frame_budget_user_set so gaming-on won't reset it).
  */
 #define RFX_FRAME_BUDGET_US_GAMING	RFX_FRAME_BUDGET_US_90
 /*
@@ -1542,11 +1551,12 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 #endif
 	} else {
 		/*
-		 * Default the gaming frame budget to 90fps (the data-proven
-		 * sustainable target on this device's thermal envelope) unless
-		 * userspace has pinned a value via the frame_budget_us sysfs.
-		 * NOTE: this is the governor's TARGET; pair it with an in-game /
-		 * GFX-tool 90fps cap for the full thermal benefit.
+		 * Set the gaming frame budget to the builtin default
+		 * (RFX_FRAME_BUDGET_US_GAMING = 90fps: the proven-best value that
+		 * keeps the proactive-sustain dormant through healthy 120fps play =
+		 * cool/low-power - see the macro comment) unless userspace has pinned
+		 * a value via the frame_budget_us sysfs. This is the governor's
+		 * sustain TARGET, not an FPS cap on the game.
 		 */
 		if (!rfx_frame_budget_user_set)
 			atomic_set(&rfx_frame_budget_us, RFX_FRAME_BUDGET_US_GAMING);
