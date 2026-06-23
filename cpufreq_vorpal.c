@@ -780,7 +780,16 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 				    rfx_pct(fmax, RFX_G_PRIME_IDLE_FLOOR_PCT);
 			cap = rfx_pct(fmax, RFX_G_PRIME_CAP_PCT);
 
-			if (fboost)
+			/*
+			 * Only lift on a frame boost if Prime is actually BUSY. The
+			 * render thread on this device lives mostly on Big and leaves
+			 * Prime idle; lifting an idle Prime to the frame floor (~92%)
+			 * during a sag/jank is pure waste heat on a core doing no
+			 * render work. Cold-start is unaffected: the moment the render
+			 * thread lands on Prime it is busy (util / hold / warmup), so
+			 * it still gets the lift exactly when it matters.
+			 */
+			if (fboost && busy)
 				fl = max(fl, rfx_pct(fmax, RFX_G_PRIME_FRAME_PCT));
 			if (freq < fl)
 				freq = fl;
@@ -810,7 +819,8 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 
 			if (busy)
 				fl = rfx_pct(fmax, RFX_G_LITTLE_FLOOR_PCT);
-			if (fboost)
+			/* Same rule as Prime: don't lift an idle Little (waste heat). */
+			if (fboost && busy)
 				fl = max(fl, rfx_pct(fmax, RFX_G_LITTLE_FRAME_PCT));
 			if (freq < fl)
 				freq = fl;
