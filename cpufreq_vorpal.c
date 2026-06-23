@@ -74,6 +74,20 @@ extern void rfx_get_util_gki510(int cpu, unsigned long boost,
 				unsigned long *util, unsigned long *bwmin);
 extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 
+/*
+ * Built-in frame pacing source. drm_vblank.c publishes the timestamp of the
+ * last DELIVERED present/flip at its send_vblank_event() chokepoint (one event
+ * = one presented frame), so frame timing is automatic whenever gaming_mode=1
+ * and the panel flips - no userspace feeder, no root, no dumpsys. DRM only
+ * publishes; the governor only consumes (no reverse dependency). Fallback to a
+ * local zero atomic if DRM is not built in.
+ */
+#if IS_ENABLED(CONFIG_DRM)
+extern atomic64_t drm_last_present_ns;
+#else
+static atomic64_t drm_last_present_ns = ATOMIC64_INIT(0);
+#endif
+
 /* ===================================================================== */
 /* Tunable defaults (KMI-safe: plain #defines, no struct-layout changes). */
 /* ===================================================================== */
@@ -120,7 +134,7 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 #define RFX_G_PRIME_IDLE_FLOOR_PCT	78	/* idle: stay warm (~2.3GHz) - skin runs cool (ap_ntc ~40C), so a higher idle floor keeps Prime ready for an incoming render thread and kills the cold-start dip, with no thermal risk */
 #define RFX_G_PRIME_BUSY_ENTER_PCT	20	/* latch busy-hold on light activity too: a bursty render thread (Delta Force) then lands on a WARM Prime (busy floor) instead of the 2400 idle floor - fixes the cold-start dip + the inter-burst sag. Safe: Prime is a single core, so the extra warmth is bounded to one CPU (unlike the 3-core Big, which overheated) */
 #define RFX_G_PRIME_CAP_PCT		100
-#define RFX_G_PRIME_FRAME_PCT		95
+#define RFX_G_PRIME_FRAME_PCT		92	/* gentle lift above the busy floor; below fmax (race-to-idle) */
 /*
  * Busy-hold hysteresis: once Prime is busy, keep it locked at the high floor
  * for this long after the last busy sample. A bursty game thread (Delta Force)
@@ -129,7 +143,7 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  * + power spikes). The hold bridges those gaps so Prime stays steady; only a
  * genuinely parked Prime (idle past the hold) relaxes to the idle floor.
  */
-#define RFX_G_PRIME_HOLD_NS		(150 * NSEC_PER_MSEC)
+#define RFX_G_PRIME_HOLD_NS		(200 * NSEC_PER_MSEC)
 /*
  * Cold-start warmup: for this long after gaming_mode=1, Prime is treated as busy
  * so it starts at the high floor. At match load the render thread is not yet
@@ -150,7 +164,7 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
  */
 #define RFX_G_BIG_FLOOR_PCT		85	/* ~2.0GHz anti-sag; race-to-idle does the rest */
 #define RFX_G_BIG_CAP_PCT		100
-#define RFX_G_BIG_FRAME_PCT		92	/* >floor: lift on a frame miss (if a feeder runs) */
+#define RFX_G_BIG_FRAME_PCT		90	/* >floor: lift on a frame miss, but below fmax */
 /*
  * Little: support work, no cap. A latency-sensitive game worker stuck on a
  * 600MHz LITTLE finishes ~3x slower than at mid OPP and can land a frame late,
@@ -162,7 +176,7 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 #define RFX_G_LITTLE_CAP_PCT		100
 #define RFX_G_LITTLE_FLOOR_PCT		58	/* ~1.05GHz mid OPP - above the 600MHz cliff, cooler than 65 */
 #define RFX_G_LITTLE_FLOOR_ENTER_PCT	12	/* apply floor unless near-idle */
-#define RFX_G_LITTLE_FRAME_PCT		80
+#define RFX_G_LITTLE_FRAME_PCT		65	/* gentle: support-cluster recovery lift */
 /*
  * LITTLE busy-hold: same hysteresis idea as Prime, tuned separately. A momentary
  * util dip below FLOOR_ENTER used to drop the floor and let LITTLE crash to fmin
@@ -264,7 +278,27 @@ extern bool rfx_dl_bw_exceeded_gki510(int cpu, unsigned long bwmin);
 
 /* ---- Frame pacing ---- */
 #define RFX_FRAME_BUDGET_US_120		8333	/* 1e6/120 */
-#define RFX_FRAME_BOOST_NS		(120 * NSEC_PER_MSEC)
+/*
+ * Recovery-boost window. SHORT on purpose (~4 frames at 120fps): a title that
+ * chronically misses its target would, with a long window, keep the boost
+ * permanently armed -> clusters pinned high -> heat -> vendor throttle -> the
+ * very FPS drops the boost tried to prevent (the v6.10 regression). 33ms means
+ * the boost is a brief nudge, not a latch.
+ */
+#define RFX_FRAME_BOOST_NS		(33 * NSEC_PER_MSEC)
+/*
+ * Anti-runaway GATE - the key safety. Only arm the recovery boost if the render
+ * (Big) cluster still has frequency headroom (running below this percent of
+ * fmax). A frame miss while Big is ALREADY near fmax is GPU / IO / thermal /
+ * placement bound, NOT frequency bound, so boosting would add heat for no FPS
+ * gain and trip the vendor thermal governor. Gating here means the feeder can
+ * never pin an already-busy cluster: it only fills in clock where recovery is
+ * physically possible (cold-start, scene transitions), so it cannot regress
+ * below the cool race-to-idle baseline.
+ */
+#define RFX_FRAME_BOOST_GATE_PCT	90
+/* Ignore present intervals longer than this (app switch / resume / paused). */
+#define RFX_FRAME_PRESENT_GAP_NS	(200 * NSEC_PER_MSEC)
 #define RFX_JANK_WINDOW_NS		(2000 * NSEC_PER_MSEC)
 
 #define IOWAIT_BOOST_MIN		(SCHED_CAPACITY_SCALE / 8)
@@ -312,6 +346,26 @@ static atomic64_t rfx_frame_boost_end_ns = ATOMIC64_INIT(0);
 
 /* Deadline until which Prime is force-held high after gaming starts (cold-start). */
 static atomic64_t rfx_gaming_warmup_end_ns = ATOMIC64_INIT(0);
+
+/*
+ * Last DRM present timestamp already consumed by frame accounting. The fast
+ * path runs far faster than the frame rate, and every gaming cluster calls
+ * rfx_frame_account, so this cmpxchg'd value claims each presented frame
+ * exactly once (no double-counting jank%, no re-arming the boost every update).
+ */
+static atomic64_t rfx_last_present_consumed = ATOMIC64_INIT(0);
+
+/*
+ * Per-perf-cluster requested frequency as a percent of fmax, published each
+ * gaming update. The frame-boost gate reads BOTH: it arms only when at least
+ * one perf cluster still has headroom (min < gate). A miss while BOTH are near
+ * fmax is GPU/IO/thermal/placement bound (boost would be heat-only); a miss
+ * while one cluster is cold (e.g. the render thread just migrated onto an
+ * idle-floored Prime) is exactly the recoverable case the boost exists for.
+ * 0 until that cluster runs (treated as headroom = arm, the safe default).
+ */
+static atomic_t rfx_sys_perf_pct = ATOMIC_INIT(0);	/* Big (render) cluster */
+static atomic_t rfx_prime_perf_pct = ATOMIC_INIT(0);	/* Prime cluster */
 
 /* All live policies, so gaming-off can reset every cluster (not just Prime). */
 static LIST_HEAD(rfx_policy_list);
@@ -541,19 +595,52 @@ static unsigned int rfx_thermal_clamp(struct rfx_policy *p, unsigned int freq,
 /* ===================================================================== */
 
 /*
- * Called for the Prime policy each gaming update. If the userspace feeder
- * reports a frame that overran 1.5x the budget, arm a short floor boost so the
- * next frames recover to 120fps. The boost lifts the floor (see target_freq),
- * never forces fmax, so load stays mid.
+ * Derive this update's frame time (microseconds), consuming each frame exactly
+ * once across all clusters. A userspace feeder write to frame_time_us takes
+ * priority (benchmark / override path); otherwise the built-in DRM present feed
+ * is used: the interval between two consecutive delivered present events = one
+ * frame's display time, automatically, with no userspace at all.
+ */
+static unsigned int rfx_frame_time_sample(void)
+{
+	unsigned int ft = atomic_xchg(&rfx_frame_time_us, 0);
+	u64 present, prev, delta;
+
+	if (ft)
+		return ft;			/* userspace override wins */
+
+	present = (u64)atomic64_read(&drm_last_present_ns);
+	if (!present)
+		return 0;			/* no DRM feed (yet) */
+
+	prev = (u64)atomic64_read(&rfx_last_present_consumed);
+	if (present == prev)
+		return 0;			/* already consumed this frame */
+
+	/* Claim this present exactly once - losers of the race bail out. */
+	if ((u64)atomic64_cmpxchg(&rfx_last_present_consumed, prev, present)
+	    != prev)
+		return 0;
+
+	if (!prev || present <= prev)
+		return 0;			/* first sample: no interval yet */
+
+	delta = present - prev;
+	if (delta > RFX_FRAME_PRESENT_GAP_NS)
+		return 0;			/* app switch / resume gap */
+
+	return (unsigned int)(delta / NSEC_PER_USEC);
+}
+
+/*
+ * Called each gaming update from any cluster. If a presented frame overran 1.5x
+ * the budget, arm a SHORT floor boost so the next frames recover - but only if
+ * the render cluster still has headroom (the gate). The boost lifts the floor
+ * (see target_freq), never forces fmax, so load stays mid and heat stays bounded.
  */
 static void rfx_frame_account(u64 time)
 {
-	/*
-	 * Consume the posted frame exactly once. The fast path runs at >300Hz,
-	 * far faster than the frame rate, so a plain read would count the same
-	 * frame many times (skewing jank% and re-arming the boost every update).
-	 */
-	unsigned int ft = atomic_xchg(&rfx_frame_time_us, 0);
+	unsigned int ft = rfx_frame_time_sample();
 	unsigned int bud = atomic_read(&rfx_frame_budget_us);
 
 	if (!ft || !bud)
@@ -561,8 +648,25 @@ static void rfx_frame_account(u64 time)
 
 	atomic_inc(&rfx_frames_seen);
 	if (ft > bud + (bud >> 1)) {
+		/*
+		 * Anti-runaway gate, evaluated over BOTH perf clusters: arm only
+		 * if the LEAST-loaded one still has headroom. If both Big and
+		 * Prime are already near fmax the miss is GPU/IO/thermal/placement
+		 * bound and a boost would be heat-only (the v6.10 runaway) - so we
+		 * count the jank but leave frequency alone. If one is cold (e.g. a
+		 * render thread just landed on an idle-floored Prime while Big is
+		 * busy) we DO arm, so that cold cluster is lifted to its frame
+		 * floor and the start/parachute dip recovers. Lifting a cluster
+		 * that is already busy is a no-op (max() with its current freq),
+		 * so no extra heat lands on the saturated core.
+		 */
+		unsigned int lo = min(atomic_read(&rfx_sys_perf_pct),
+				      atomic_read(&rfx_prime_perf_pct));
+
 		atomic_inc(&rfx_janks_seen);
-		atomic64_set(&rfx_frame_boost_end_ns, time + RFX_FRAME_BOOST_NS);
+		if (lo < RFX_FRAME_BOOST_GATE_PCT)
+			atomic64_set(&rfx_frame_boost_end_ns,
+				     time + RFX_FRAME_BOOST_NS);
 	}
 }
 
@@ -705,6 +809,21 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 
 	freq = rfx_thermal_clamp(p, freq, fmax, time);
 	freq = clamp(freq, fmin, fmax);
+
+	/*
+	 * Publish each perf cluster's headroom for the frame-boost gate. The
+	 * render thread can live on Big OR Prime, so the gate needs both: it
+	 * arms when the least-loaded perf cluster still has room (see
+	 * rfx_frame_account). Little is support work, not a gate input.
+	 */
+	if (gaming) {
+		unsigned int pct = (unsigned int)((u64)freq * 100 / fmax);
+
+		if (prime)
+			atomic_set(&rfx_prime_perf_pct, pct);
+		else if (!little)
+			atomic_set(&rfx_sys_perf_pct, pct);
+	}
 
 	if (freq == p->cached_raw_freq && !p->need_freq_update)
 		return p->next_freq;
@@ -856,13 +975,29 @@ static bool rfx_commit_freq(struct rfx_policy *p, u64 time, unsigned int next_fr
 
 	if (next_freq < p->next_freq) {
 		delta = (s64)(time - p->last_downfreq_time);
-		if (p->down_rate_delay_ns > 0 && delta < p->down_rate_delay_ns)
+		if (p->down_rate_delay_ns > 0 && delta < p->down_rate_delay_ns) {
+			/*
+			 * Down-step deferred by the rate limiter. We must NOT
+			 * leave the OPP cache pointing at this (lower) raw freq
+			 * while next_freq still holds the old (higher) one: the
+			 * cache short-circuit in rfx_target_freq would then keep
+			 * returning the stale-high next_freq every update and the
+			 * frequency would stay pinned high far longer than the
+			 * intended rate-limit window (stuck-high -> wasted heat ->
+			 * vendor throttle). Invalidate the cache so the next
+			 * evaluation re-derives the true target and commits the
+			 * down-step as soon as the window elapses.
+			 */
+			p->cached_raw_freq = 0;
 			return false;
+		}
 		p->last_downfreq_time = time;
 	} else {
 		delta = (s64)(time - p->last_upfreq_time);
-		if (p->up_rate_delay_ns > 0 && delta < p->up_rate_delay_ns)
+		if (p->up_rate_delay_ns > 0 && delta < p->up_rate_delay_ns) {
+			p->cached_raw_freq = 0;
 			return false;
+		}
 		p->last_upfreq_time = time;
 	}
 
@@ -1309,6 +1444,9 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 		atomic_set(&rfx_frames_seen, 0);
 		atomic_set(&rfx_janks_seen, 0);
 		atomic_set(&rfx_jank_pct, 0);
+		atomic64_set(&rfx_last_present_consumed, 0);
+		atomic_set(&rfx_sys_perf_pct, 0);
+		atomic_set(&rfx_prime_perf_pct, 0);
 		rfx_reset_all_policies();
 		atomic64_set(&rfx_gaming_warmup_end_ns, 0);
 #ifdef CONFIG_THERMAL
@@ -1319,6 +1457,10 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 		/* Default the budget to 120fps unless userspace set it. */
 		if (!atomic_read(&rfx_frame_budget_us))
 			atomic_set(&rfx_frame_budget_us, RFX_FRAME_BUDGET_US_120);
+		/* Fresh frame-pacing baseline so the first interval is sane. */
+		atomic64_set(&rfx_last_present_consumed, 0);
+		atomic_set(&rfx_sys_perf_pct, 0);
+		atomic_set(&rfx_prime_perf_pct, 0);
 		/* Pre-warm Prime so the first frames don't land on a cold core. */
 		atomic64_set(&rfx_gaming_warmup_end_ns,
 			     ktime_get_ns() + RFX_G_PRIME_WARMUP_NS);
