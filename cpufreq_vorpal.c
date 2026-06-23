@@ -187,6 +187,19 @@ static atomic64_t drm_last_present_ns = ATOMIC64_INIT(0);
 #define RFX_G_LITTLE_FLOOR_ENTER_PCT	12	/* apply floor unless near-idle */
 #define RFX_G_LITTLE_FRAME_PCT		65	/* gentle: support-cluster recovery lift */
 /*
+ * Cross-cluster sync. When a PERF cluster (Big or Prime) is saturated at the
+ * frame's critical path, the LITTLE support threads (audio, net, input, asset
+ * decode) must keep pace or they bottleneck the frame even though the render
+ * cluster is at max. Telemetry showed LITTLE pinned 80-90% busy carrying this
+ * support work. So when a perf cluster crosses SAT_PCT, lift LITTLE's floor to
+ * SYNC_FLOOR (~1.3GHz) - but ONLY while LITTLE is itself busy (never lift an
+ * idle LITTLE = no waste heat). This adds clock ONLY to the coolest, highest-
+ * headroom cluster, and ONLY in the heavy moments where it helps, so it does
+ * NOT heat the already-maxed perf clusters (the documented floor-raise trap).
+ */
+#define RFX_G_PERF_SAT_PCT		92	/* a perf cluster this close to fmax = saturated */
+#define RFX_G_LITTLE_SYNC_FLOOR_PCT	72	/* ~1.3GHz: keep support threads in step */
+/*
  * LITTLE busy-hold: same hysteresis idea as Prime, tuned separately. A momentary
  * util dip below FLOOR_ENTER used to drop the floor and let LITTLE crash to fmin
  * (600MHz) mid-gaming - a latency-sensitive worker landing there then stalled.
@@ -860,6 +873,16 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 			/* Same rule as Prime: don't lift an idle Little (waste heat). */
 			if (fboost && busy)
 				fl = max(fl, rfx_pct(fmax, RFX_G_LITTLE_FRAME_PCT));
+			/*
+			 * Cross-cluster sync: a saturated Big/Prime means the frame's
+			 * critical path is on a perf core; lift the busy LITTLE support
+			 * threads so they keep pace (heat-cheap: coolest cluster, only
+			 * when busy AND a perf cluster is actually saturated).
+			 */
+			if (busy &&
+			    (atomic_read(&rfx_sys_perf_pct) >= RFX_G_PERF_SAT_PCT ||
+			     atomic_read(&rfx_prime_perf_pct) >= RFX_G_PERF_SAT_PCT))
+				fl = max(fl, rfx_pct(fmax, RFX_G_LITTLE_SYNC_FLOOR_PCT));
 			if (freq < fl)
 				freq = fl;
 			if (freq > cap)
