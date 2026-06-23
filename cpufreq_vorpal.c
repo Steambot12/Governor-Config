@@ -113,8 +113,17 @@ static atomic64_t drm_last_present_ns = ATOMIC64_INIT(0);
  * Gaming down-rate-limit. While gaming, frequency may only step DOWN this
  * slowly (microseconds). Combined with the floors below this is what kills
  * the yoyo / sawtooth: the clock parks in the high band and decays gently.
+ *
+ * 150ms = the value from the user's PROVEN-STABLE "PERFECT BUILD" commit
+ * (95c3e68: jank 1%, avg 117.7fps, 5.3W, <40C). That build's whole theme was a
+ * STEADY gaming clock - hold high, decay slowly - and a long down-rate is the
+ * single biggest contributor. Safe thermally: the down-rate only acts while
+ * freq is ABOVE demand and descending; the sustained heat we measured comes
+ * from genuine util-pegging (demand), which a slow down-rate does NOT add to.
+ * Up stays instant (up-rate 0 + EMA instant-attack), so a real spike is served
+ * immediately; only the DECAY is slowed -> fast-attack / slow-decay = steady.
  */
-#define RFX_GAMING_DOWN_US		30000
+#define RFX_GAMING_DOWN_US		150000
 
 /* ---- Gaming frequency band, percent of policy fmax ---- */
 /*
@@ -278,6 +287,24 @@ static atomic64_t drm_last_present_ns = ATOMIC64_INIT(0);
 
 /* ---- Frame pacing ---- */
 #define RFX_FRAME_BUDGET_US_120		8333	/* 1e6/120 */
+#define RFX_FRAME_BUDGET_US_90		11111	/* 1e6/90  */
+/*
+ * Default gaming frame budget = 90fps. This is the PROVEN-STABLE value (28-min
+ * PUBG: jank 1.7%, min 74.9, avg 117.7, 46.5C, 5.86W). Setting it to 120fps was
+ * measured to be MUCH WORSE: at 8333us the proactive-sustain arms the instant
+ * frame time slides past ~8.83ms (~113fps), i.e. for the whole 113-120 band, so
+ * on a device already near its thermal envelope it chased every shallow sag ->
+ * extra clock -> faster junction climb -> earlier vendor throttle -> MORE drops.
+ * The recurring wall: pushing the governor to defend 120 harder costs more heat
+ * than it gives. At 11111us/90fps the sustain stays dormant through normal 120fps
+ * play (frames look on-time vs the larger budget) so the clock races-to-idle and
+ * stays cool; it only wakes for a genuinely deep sag (< ~85fps). The remaining
+ * shallow drops on this build are single heavy frames near the cpufreq floor -
+ * the real lever for fully removing them is the in-game FPS cap, not the budget.
+ * Userspace can still pin any value via the frame_budget_us sysfs (a middle 100fps
+ * = echo 10000 catches the deeper sags without the 120-budget heat, if wanted).
+ */
+#define RFX_FRAME_BUDGET_US_GAMING	RFX_FRAME_BUDGET_US_90
 /*
  * Recovery-boost window. SHORT on purpose (~4 frames at 120fps): a title that
  * chronically misses its target would, with a long window, keep the boost
@@ -351,7 +378,9 @@ static atomic_t rfx_temp_mc = ATOMIC_INIT(0);
 
 /* Frame pacing telemetry (userspace feeder writes frame_time_us). */
 static atomic_t rfx_frame_time_us = ATOMIC_INIT(0);
-static atomic_t rfx_frame_budget_us = ATOMIC_INIT(RFX_FRAME_BUDGET_US_120);
+static atomic_t rfx_frame_budget_us = ATOMIC_INIT(RFX_FRAME_BUDGET_US_GAMING);
+/* True once userspace pins frame_budget_us via sysfs -> gaming won't auto-set it. */
+static bool rfx_frame_budget_user_set;
 static atomic_t rfx_frames_seen = ATOMIC_INIT(0);
 static atomic_t rfx_janks_seen = ATOMIC_INIT(0);
 static atomic_t rfx_jank_pct = ATOMIC_INIT(0);
@@ -1512,9 +1541,15 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 		rfx_tz_release_auto();
 #endif
 	} else {
-		/* Default the budget to 120fps unless userspace set it. */
-		if (!atomic_read(&rfx_frame_budget_us))
-			atomic_set(&rfx_frame_budget_us, RFX_FRAME_BUDGET_US_120);
+		/*
+		 * Default the gaming frame budget to 90fps (the data-proven
+		 * sustainable target on this device's thermal envelope) unless
+		 * userspace has pinned a value via the frame_budget_us sysfs.
+		 * NOTE: this is the governor's TARGET; pair it with an in-game /
+		 * GFX-tool 90fps cap for the full thermal benefit.
+		 */
+		if (!rfx_frame_budget_user_set)
+			atomic_set(&rfx_frame_budget_us, RFX_FRAME_BUDGET_US_GAMING);
 		/* Fresh frame-pacing baseline so the first interval is sane. */
 		atomic_set(&rfx_ft_ema_us, 0);
 		atomic64_set(&rfx_last_present_consumed, 0);
@@ -1603,6 +1638,7 @@ static ssize_t frame_budget_us_store(struct gov_attr_set *attr_set,
 	if (kstrtouint(buf, 10, &val) || val < 1000)
 		return -EINVAL;
 	atomic_set(&rfx_frame_budget_us, val);
+	rfx_frame_budget_user_set = true;	/* honour the manual pin over the gaming default */
 	return count;
 }
 static struct governor_attr frame_budget_us = __ATTR_RW(frame_budget_us);
