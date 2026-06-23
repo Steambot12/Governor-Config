@@ -301,6 +301,26 @@ static atomic64_t drm_last_present_ns = ATOMIC64_INIT(0);
 #define RFX_FRAME_PRESENT_GAP_NS	(200 * NSEC_PER_MSEC)
 #define RFX_JANK_WINDOW_NS		(2000 * NSEC_PER_MSEC)
 
+/*
+ * Proactive frame-margin SUSTAIN. The reactive boost above only fires once a
+ * frame has already overrun 1.5x budget (a real jank, FPS already ~80). To hold
+ * a steady 120fps with min ~117, we must also catch frames that are MEROSOT -
+ * sliding below the target but not yet a jank. We watch a SMOOTHED frame time
+ * (rfx_ft_ema_us, EMA below) and arm the same bounded, gated boost as soon as it
+ * creeps past this percent of budget. 106% of an 8333us budget = ~113fps, so the
+ * sustain floor engages while FPS is dipping toward - but still above - 117, and
+ * pulls it back before the dip is visible. CRUCIAL non-greedy property: when the
+ * game is truly on-cadence the smoothed frame time sits at ~100% of budget
+ * (one present per vsync), which is BELOW this threshold, so the feature is
+ * OFF and the clusters stay in race-to-idle - average CPU load is unchanged.
+ * It only spends power on the edge, never in easy scenes. Raise toward 110-115
+ * to make it lazier (less power, fewer interventions); lower toward 103 to chase
+ * 120 harder (more power). The same headroom gate + 33ms window + below-fmax
+ * boost floors bound it, so it cannot run away the way the v7.x perf-loops did.
+ */
+#define RFX_FRAME_SUSTAIN_PCT		106	/* arm proactively when EMA frame time > this % of budget (~113fps) */
+#define RFX_FT_EMA_SHIFT		2	/* frame-time EMA: alpha = 1/4 (anti single-frame noise) */
+
 #define IOWAIT_BOOST_MIN		(SCHED_CAPACITY_SCALE / 8)
 
 enum rfx_cluster_type {
@@ -335,6 +355,8 @@ static atomic_t rfx_frame_budget_us = ATOMIC_INIT(RFX_FRAME_BUDGET_US_120);
 static atomic_t rfx_frames_seen = ATOMIC_INIT(0);
 static atomic_t rfx_janks_seen = ATOMIC_INIT(0);
 static atomic_t rfx_jank_pct = ATOMIC_INIT(0);
+/* Smoothed frame time (us) for the proactive sustain controller. 0 = unset. */
+static atomic_t rfx_ft_ema_us = ATOMIC_INIT(0);
 
 /*
  * Frame-miss boost deadline (ns since boot), GLOBAL so every cluster reacts to
@@ -642,28 +664,53 @@ static void rfx_frame_account(u64 time)
 {
 	unsigned int ft = rfx_frame_time_sample();
 	unsigned int bud = atomic_read(&rfx_frame_budget_us);
+	int ema;
+	bool jank, sag, want_boost;
 
 	if (!ft || !bud)
 		return;
 
 	atomic_inc(&rfx_frames_seen);
-	if (ft > bud + (bud >> 1)) {
+
+	/*
+	 * Smooth the frame time so a single noisy present does not drive control;
+	 * the proactive sustain decision runs off this EMA, not the raw sample.
+	 */
+	ema = atomic_read(&rfx_ft_ema_us);
+	ema = ema ? ema + (((int)ft - ema) >> RFX_FT_EMA_SHIFT) : (int)ft;
+	atomic_set(&rfx_ft_ema_us, ema);
+
+	/* Reactive: a real jank (raw frame already overran 1.5x budget). */
+	jank = ft > bud + (bud >> 1);
+	if (jank)
+		atomic_inc(&rfx_janks_seen);
+
+	/*
+	 * Proactive sustain: the SMOOTHED frame time has crept into the sag band
+	 * (FPS sliding below ~113 but not yet a jank). Catch it BEFORE it becomes
+	 * a visible drop so min-FPS holds near the 120 target. Off entirely when
+	 * frames are on-cadence (ema ~ budget < threshold) -> easy scenes stay in
+	 * race-to-idle and average CPU load is unchanged (not greedy).
+	 */
+	sag = (s64)ema * 100 > (s64)bud * RFX_FRAME_SUSTAIN_PCT;
+
+	want_boost = jank || sag;
+	if (want_boost) {
 		/*
-		 * Anti-runaway gate, evaluated over BOTH perf clusters: arm only
-		 * if the LEAST-loaded one still has headroom. If both Big and
-		 * Prime are already near fmax the miss is GPU/IO/thermal/placement
-		 * bound and a boost would be heat-only (the v6.10 runaway) - so we
-		 * count the jank but leave frequency alone. If one is cold (e.g. a
-		 * render thread just landed on an idle-floored Prime while Big is
-		 * busy) we DO arm, so that cold cluster is lifted to its frame
-		 * floor and the start/parachute dip recovers. Lifting a cluster
-		 * that is already busy is a no-op (max() with its current freq),
-		 * so no extra heat lands on the saturated core.
+		 * Anti-runaway gate over BOTH perf clusters: arm only if the
+		 * LEAST-loaded one still has headroom. If both Big and Prime are
+		 * already near fmax, the device is GPU/IO/thermal/placement bound
+		 * and a boost would be heat-only (the v6.10 runaway) - so leave
+		 * frequency alone (jank, if any, is still counted). If one is cold
+		 * (a render thread just landed on an idle-floored Prime while Big
+		 * is busy, or a cluster sagging in the margin band) we DO arm, so
+		 * it lifts to its bounded frame floor and FPS recovers. Lifting a
+		 * cluster that is already busy is a no-op via max(), so no extra
+		 * heat lands on a saturated core.
 		 */
 		unsigned int lo = min(atomic_read(&rfx_sys_perf_pct),
 				      atomic_read(&rfx_prime_perf_pct));
 
-		atomic_inc(&rfx_janks_seen);
 		if (lo < RFX_FRAME_BOOST_GATE_PCT)
 			atomic64_set(&rfx_frame_boost_end_ns,
 				     time + RFX_FRAME_BOOST_NS);
@@ -1444,6 +1491,7 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 		atomic_set(&rfx_frames_seen, 0);
 		atomic_set(&rfx_janks_seen, 0);
 		atomic_set(&rfx_jank_pct, 0);
+		atomic_set(&rfx_ft_ema_us, 0);
 		atomic64_set(&rfx_last_present_consumed, 0);
 		atomic_set(&rfx_sys_perf_pct, 0);
 		atomic_set(&rfx_prime_perf_pct, 0);
@@ -1458,6 +1506,7 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 		if (!atomic_read(&rfx_frame_budget_us))
 			atomic_set(&rfx_frame_budget_us, RFX_FRAME_BUDGET_US_120);
 		/* Fresh frame-pacing baseline so the first interval is sane. */
+		atomic_set(&rfx_ft_ema_us, 0);
 		atomic64_set(&rfx_last_present_consumed, 0);
 		atomic_set(&rfx_sys_perf_pct, 0);
 		atomic_set(&rfx_prime_perf_pct, 0);
