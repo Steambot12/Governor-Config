@@ -1051,13 +1051,17 @@ static void update_curr(struct cfs_rq *cfs_rq)
     update_burst_penalty(curr);
 #endif // CONFIG_SCHED_BORE
 
-/* Gaming mode: stretch vruntime for background tasks */
-        if (unlikely(sched_gaming_active && !entity_is_task(curr))) {
-                curr->vruntime += calc_delta_fair(delta_exec * (GAMING_VRUNTIME_STRETCH - 1), curr);
-        } else if (unlikely(sched_gaming_active && entity_is_task(curr) &&
-                            curr->avg.load_avg < 100)) {
-                curr->vruntime += calc_delta_fair(delta_exec, curr);
-        }
+	/*
+	 * Gaming mode: penalise only genuinely background TASKS (nice > 0).
+	 * Never touch non-task entities (cgroups) — the old code quadrupled
+	 * vruntime for the whole cgroup, starving every task inside including
+	 * the game's own render thread.  The load_avg < 100 clause is also
+	 * removed: it punished lightweight but latency-critical threads
+	 * (audio mixer, input reader) that happen to run briefly.
+	 */
+	if (unlikely(sched_gaming_active && entity_is_task(curr) &&
+		     task_of(curr)->static_prio > DEFAULT_PRIO))
+		curr->vruntime += calc_delta_fair(delta_exec, curr);
     update_min_vruntime(cfs_rq);
 
     if (entity_is_task(curr)) {
@@ -4762,14 +4766,19 @@ check_preempt_tick(struct cfs_rq *cfs_rq, struct sched_entity *curr)
 	ideal_runtime = sched_slice(cfs_rq, curr);
 	delta_exec = curr->sum_exec_runtime - curr->prev_sum_exec_runtime;
 	/*
-         * Gaming mode: reduce ideal runtime for background tasks
-         */
-        if (unlikely(sched_gaming_active && entity_is_task(curr))) {
-                struct task_struct *p = task_of(curr);
-                if (p->static_prio > DEFAULT_PRIO &&
-                    delta_exec > ideal_runtime / 2)
-                        resched_curr(rq_of(cfs_rq));
-        }
+	 * Gaming mode: preempt background tasks (nice >= 3) that have consumed
+	 * 2/3 of their slice.  nice >= 3 protects game-support threads (audio,
+	 * input, SF helpers at nice 0-2) while cutting Android background
+	 * services (sync adapters, content providers, GMS at nice 3+) short.
+	 * The old nice >= 5 / 75% was too permissive — background work piled
+	 * up and added ~0.5W cumulative heat.
+	 */
+	if (unlikely(sched_gaming_active && entity_is_task(curr))) {
+		struct task_struct *p = task_of(curr);
+		if (p->static_prio >= DEFAULT_PRIO + 3 &&
+		    delta_exec > (ideal_runtime * 2 / 3))
+			resched_curr(rq_of(cfs_rq));
+	}
 	trace_android_rvh_check_preempt_tick(current, &ideal_runtime, &skip_preempt,
 			delta_exec, cfs_rq, curr, sysctl_sched_min_granularity);
 	if (skip_preempt)
