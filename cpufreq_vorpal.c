@@ -140,7 +140,7 @@ static atomic64_t drm_last_present_ns = ATOMIC64_INIT(0);
  * to a lower idle floor otherwise (up-rate is 0 so it snaps back instantly).
  */
 #define RFX_G_PRIME_FLOOR_PCT		90	/* busy: locked high */
-#define RFX_G_PRIME_IDLE_FLOOR_PCT	78	/* idle: stay warm (~2.3GHz) - skin runs cool (ap_ntc ~40C), so a higher idle floor keeps Prime ready for an incoming render thread and kills the cold-start dip, with no thermal risk */
+#define RFX_G_PRIME_IDLE_FLOOR_PCT	72	/* idle: warm enough (~2.1GHz) for quick snap-up, but below the 78% that added idle heat when combined with Big floor + background task fix; up-rate=0 so recovery is instant */
 #define RFX_G_PRIME_BUSY_ENTER_PCT	20	/* latch busy-hold on light activity too: a bursty render thread (Delta Force) then lands on a WARM Prime (busy floor) instead of the 2400 idle floor - fixes the cold-start dip + the inter-burst sag. Safe: Prime is a single core, so the extra warmth is bounded to one CPU (unlike the 3-core Big, which overheated) */
 #define RFX_G_PRIME_CAP_PCT		100
 #define RFX_G_PRIME_FRAME_PCT		92	/* gentle lift above the busy floor; below fmax (race-to-idle) */
@@ -154,13 +154,20 @@ static atomic64_t drm_last_present_ns = ATOMIC64_INIT(0);
  */
 #define RFX_G_PRIME_HOLD_NS		(200 * NSEC_PER_MSEC)
 /*
- * Cold-start warmup: for this long after gaming_mode=1, Prime is treated as busy
- * so it starts at the high floor. At match load the render thread is not yet
- * established (util low) -> without this Prime sits at the 2400 idle floor and
- * the first frames land on a cold core (the recurring start-of-match dip). One
- * single core held high for a few seconds = negligible heat.
+ * Cold-start warmup: for this long, Prime is treated as busy so it sits at the
+ * high floor and the first gameplay frames do NOT land on a cold (idle-floored)
+ * core - the recurring start-of-match deep dip (e.g. 120 -> 63.8fps).
+ *
+ * Armed at gaming_mode=1 AND, crucially, RE-ARMED whenever rendering resumes
+ * after a present gap (see rfx_frame_time_sample). The old build armed it only
+ * at the gaming_mode toggle, but users enable gaming mode in the lobby/menu -
+ * minutes before the match actually spawns - so the 3s window had long expired
+ * by the time real gameplay rendered = the warmup never covered the true cold
+ * start. Re-arming on present-resume anchors the pre-warm to ACTUAL gameplay
+ * start (match load / scene transition), regardless of when the mode was set.
+ * 5s covers the load->spawn->first-frames window; single core = negligible heat.
  */
-#define RFX_G_PRIME_WARMUP_NS		(3000 * NSEC_PER_MSEC)
+#define RFX_G_PRIME_WARMUP_NS		(5000 * NSEC_PER_MSEC)
 /*
  * Big: the render thread lives mostly HERE, but a HIGH flat floor backfires -
  * 3 Big cores pinned high run hot, and on this device that heat trips the VENDOR
@@ -171,7 +178,7 @@ static atomic64_t drm_last_present_ns = ATOMIC64_INIT(0);
  * zero up-rate, so Big jumps to fmax on a real demand spike and idles between =
  * coolest, stays under the vendor trip, sustains FPS. 85% is the cool-stable edge.
  */
-#define RFX_G_BIG_FLOOR_PCT		85	/* ~2.0GHz anti-sag; race-to-idle does the rest */
+#define RFX_G_BIG_FLOOR_PCT		85	/* ~2.0GHz: 88% ran 3 Big cores too hot (6W, 41°C/10min, tripped vendor throttle → jank); 85% is the proven cool-stable edge */
 #define RFX_G_BIG_CAP_PCT		100
 #define RFX_G_BIG_FRAME_PCT		90	/* >floor: lift on a frame miss, but below fmax */
 /*
@@ -226,7 +233,7 @@ static atomic64_t drm_last_present_ns = ATOMIC64_INIT(0);
  * LITTLE util is genuinely high (real work); at true idle, util-following keeps
  * the freq low regardless of the cap. UI-active still relaxes further to 90%.
  */
-#define RFX_D_LITTLE_CAP_PCT		78	/* idle cap (was 65): stop starving undetected UI bursts */
+#define RFX_D_LITTLE_CAP_PCT		82	/* idle cap: high enough for keyboard, video captions, gentle scrolls */
 #define RFX_D_LITTLE_BOOST_CAP_PCT	90	/* relax cap while UI active */
 #define RFX_D_LITTLE_UI_FLOOR_PCT	58	/* LITTLE floor while UI active */
 #define RFX_D_BIG_UI_FLOOR_PCT		55	/* Big floor while UI active */
@@ -241,8 +248,8 @@ static atomic64_t drm_last_present_ns = ATOMIC64_INIT(0);
  * first frames of a burst immediately, independent of input - the core fix for
  * the gaming_mode=0 display/UI stutter.
  */
-#define RFX_D_RAMP_DELTA_PCT		12
-#define RFX_D_UI_BOOST_NS		(150 * NSEC_PER_MSEC)
+#define RFX_D_RAMP_DELTA_PCT		8	/* lower threshold catches gradual UI work (keyboard, video captions) */
+#define RFX_D_UI_BOOST_NS		(200 * NSEC_PER_MSEC)	/* hold UI floor through a full app transition / keyboard draw */
 
 /*
  * Touch window, lengthened 90 -> 220 ms so a tap-initiated app open/close
@@ -253,7 +260,7 @@ static atomic64_t drm_last_present_ns = ATOMIC64_INIT(0);
 
 /* ---- Util EMA (directional smoothing). new>old: up_shift, else down_shift ---- */
 #define RFX_EMA_UP_SHIFT_DAILY		0	/* instant attack: a render-thread burst (texture upload / compositing) gets clock immediately -> shorter RT spike -> less daily frame-time jitter. Decay stays slow (down-shift 3), so ~no battery cost */
-#define RFX_EMA_DN_SHIFT_DAILY		3	/* decay gently: no inter-frame sag */
+#define RFX_EMA_DN_SHIFT_DAILY		2	/* faster decay: prevents thermal creep on long daily use while still bridging inter-frame gaps */
 #define RFX_EMA_UP_SHIFT_GAMING		0	/* instant attack: no lag on a render spike */
 #define RFX_EMA_DN_SHIFT_GAMING		3	/* decay slowly -> anti-jitter */
 
@@ -347,7 +354,7 @@ static atomic64_t drm_last_present_ns = ATOMIC64_INIT(0);
  */
 #define RFX_FRAME_BOOST_GATE_PCT	90
 /* Ignore present intervals longer than this (app switch / resume / paused). */
-#define RFX_FRAME_PRESENT_GAP_NS	(200 * NSEC_PER_MSEC)
+#define RFX_FRAME_PRESENT_GAP_NS	(500 * NSEC_PER_MSEC)	/* re-arm warmup after real scene transitions / loading screens; 200ms was too eager (cutscenes), 2000ms too lazy (missed match-start → 80fps cold dip) */
 #define RFX_JANK_WINDOW_NS		(2000 * NSEC_PER_MSEC)
 
 /*
@@ -699,8 +706,18 @@ static unsigned int rfx_frame_time_sample(void)
 		return 0;			/* first sample: no interval yet */
 
 	delta = present - prev;
-	if (delta > RFX_FRAME_PRESENT_GAP_NS)
-		return 0;			/* app switch / resume gap */
+	if (delta > RFX_FRAME_PRESENT_GAP_NS) {
+		/*
+		 * Rendering just resumed after a pause (match load / scene
+		 * transition / resume). This is the TRUE cold start - re-arm the
+		 * Prime warmup so the first frames after the gap land on a warm
+		 * core, not the idle floor (the start-of-match deep dip). Anchors
+		 * the pre-warm to actual gameplay start, not the gaming_mode toggle.
+		 */
+		atomic64_set(&rfx_gaming_warmup_end_ns,
+			     present + RFX_G_PRIME_WARMUP_NS);
+		return 0;			/* gap itself is not a frame time */
+	}
 
 	return (unsigned int)(delta / NSEC_PER_USEC);
 }
@@ -775,6 +792,14 @@ static inline bool rfx_frame_boost_active(u64 time)
 	return end && time < end;
 }
 
+/* Cold-start launch window: Prime forced busy + Little held at launch readiness. */
+static inline bool rfx_in_warmup(u64 time)
+{
+	u64 end = (u64)atomic64_read(&rfx_gaming_warmup_end_ns);
+
+	return end && time < end;
+}
+
 /* ===================================================================== */
 /* Frequency decision                                                    */
 /* ===================================================================== */
@@ -825,7 +850,7 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 			busy = (upct >= RFX_G_PRIME_BUSY_ENTER_PCT) ||
 			       (p->prime_busy_hold_ns &&
 				time < p->prime_busy_hold_ns) ||
-			       time < (u64)atomic64_read(&rfx_gaming_warmup_end_ns);
+			       rfx_in_warmup(time);
 
 			fl = busy ? rfx_pct(fmax, RFX_G_PRIME_FLOOR_PCT) :
 				    rfx_pct(fmax, RFX_G_PRIME_IDLE_FLOOR_PCT);
@@ -882,6 +907,15 @@ static unsigned int rfx_target_freq(struct rfx_policy *p, unsigned long util,
 			if (busy &&
 			    (atomic_read(&rfx_sys_perf_pct) >= RFX_G_PERF_SAT_PCT ||
 			     atomic_read(&rfx_prime_perf_pct) >= RFX_G_PERF_SAT_PCT))
+				fl = max(fl, rfx_pct(fmax, RFX_G_LITTLE_SYNC_FLOOR_PCT));
+			/*
+			 * Cold-start launch readiness: during the warmup window hold
+			 * Little at the sync floor even if not yet busy, so the spawn
+			 * burst (physics / audio / asset-decode support threads) is
+			 * served from the first frame instead of ramping up late.
+			 * Time-bounded to the launch window -> no steady-state heat.
+			 */
+			if (rfx_in_warmup(time))
 				fl = max(fl, rfx_pct(fmax, RFX_G_LITTLE_SYNC_FLOOR_PCT));
 			if (freq < fl)
 				freq = fl;
@@ -1559,6 +1593,12 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 
 	if (!val) {
 		atomic_set(&rfx_frame_time_us, 0);
+		/* Flush per-CPU EMA so gaming residue doesn't bias daily freq. */
+		{
+			int cpu;
+			for_each_possible_cpu(cpu)
+				per_cpu(rfx_cpu, cpu).filt_util = 0;
+		}
 		atomic_set(&rfx_frames_seen, 0);
 		atomic_set(&rfx_janks_seen, 0);
 		atomic_set(&rfx_jank_pct, 0);
@@ -1589,6 +1629,12 @@ static ssize_t gaming_mode_store(struct gov_attr_set *attr_set,
 		atomic_set(&rfx_sys_perf_pct, 0);
 		atomic_set(&rfx_prime_perf_pct, 0);
 		/* Pre-warm Prime so the first frames don't land on a cold core. */
+		/* Flush per-CPU EMA so daily residue doesn't hold freq low. */
+		{
+			int cpu;
+			for_each_possible_cpu(cpu)
+				per_cpu(rfx_cpu, cpu).filt_util = 0;
+		}
 		atomic64_set(&rfx_gaming_warmup_end_ns,
 			     ktime_get_ns() + RFX_G_PRIME_WARMUP_NS);
 #ifdef CONFIG_THERMAL
