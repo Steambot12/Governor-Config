@@ -27,7 +27,7 @@ CONFIG_THREAD_INFO_IN_TASK=y
 CONFIG_INIT_ENV_ARG_LIMIT=32
 # CONFIG_COMPILE_TEST is not set
 CONFIG_WERROR=y
-CONFIG_LOCALVERSION="-Templar-v5.1-ReSuki"
+CONFIG_LOCALVERSION="-v5.1-ReSuki"
 # CONFIG_LOCALVERSION_AUTO is not set
 CONFIG_BUILD_SALT=""
 CONFIG_DEFAULT_INIT=""
@@ -562,7 +562,7 @@ CONFIG_RELOCATABLE=y
 CONFIG_RANDOMIZE_BASE=y
 # CONFIG_RANDOMIZE_MODULE_REGION_FULL is not set
 # CONFIG_STACKPROTECTOR_PER_TASK is not set
-CONFIG_CMDLINE="stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=none cgroup.memory=nokmem noirqdebug audit=0 loglevel=3 thermal.off=0 rcu_nocbs=7 rcupdate.rcu_idle_gp_delay=3 nohz=on timer_migration=1 transparent_hugepage=madvise cpuidle.off=0 workqueue.power_efficient=1"
+CONFIG_CMDLINE="stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=none cgroup.memory=nokmem noirqdebug loglevel=3 thermal.off=0 rcu_nocbs=7 rcupdate.rcu_idle_gp_delay=3 nohz=on timer_migration=1 transparent_hugepage=madvise cpuidle.off=0 workqueue.power_efficient=1"
 # end of Kernel Features
 
 #
@@ -3197,7 +3197,6 @@ CONFIG_THERMAL=y
 CONFIG_THERMAL_NETLINK=y
 CONFIG_THERMAL_STATISTICS=y
 CONFIG_THERMAL_EMERGENCY_POWEROFF_DELAY_MS=1000
-CONFIG_THERMAL_GOV_LOW_LIMITS=y
 # CONFIG_CPU_THERMAL_AGGRESSIVE is not set
 CONFIG_THERMAL_OF=y
 CONFIG_THERMAL_WRITABLE_TRIPS=y
@@ -3207,6 +3206,7 @@ CONFIG_THERMAL_DEFAULT_GOV_STEP_WISE=y
 # CONFIG_THERMAL_DEFAULT_GOV_POWER_ALLOCATOR is not set
 CONFIG_THERMAL_GOV_FAIR_SHARE=y
 # CONFIG_THERMAL_GOV_BANG_BANG is not set
+# CONFIG_THERMAL_GOV_LOW_LIMITS is not set
 CONFIG_THERMAL_GOV_USER_SPACE=y
 CONFIG_THERMAL_GOV_POWER_ALLOCATOR=y
 CONFIG_THERMAL_GOV_STEP_WISE=y
