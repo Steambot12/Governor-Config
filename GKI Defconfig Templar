@@ -127,7 +127,7 @@ CONFIG_RCU_FANOUT=64
 CONFIG_RCU_FANOUT_LEAF=16
 CONFIG_RCU_FAST_NO_HZ=y
 CONFIG_RCU_BOOST=y
-CONFIG_RCU_BOOST_DELAY=5
+CONFIG_RCU_BOOST_DELAY=15
 CONFIG_RCU_NOCB_CPU=y
 CONFIG_RCU_NOCB_CPU_DEFAULT_ALL=y
 # CONFIG_TASKS_TRACE_RCU_READ_MB is not set
@@ -562,7 +562,7 @@ CONFIG_RELOCATABLE=y
 CONFIG_RANDOMIZE_BASE=y
 # CONFIG_RANDOMIZE_MODULE_REGION_FULL is not set
 # CONFIG_STACKPROTECTOR_PER_TASK is not set
-CONFIG_CMDLINE="stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=none cgroup.memory=nokmem noirqdebug loglevel=3 rcu_nocbs=0-5 rcupdate.rcu_idle_gp_delay=2 nohz=on timer_migration=1 transparent_hugepage=madvise cpuidle.off=0 skew_tick=1"
+CONFIG_CMDLINE="stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=none cgroup_disable=pressure cgroup.memory=nokmem noirqdebug loglevel=3 thermal.off=0 rcu_nocbs=0-7 rcupdate.rcu_idle_gp_delay=3 nohz=on timer_migration=1 transparent_hugepage=madvise cpuidle.off=0 cpuidle.governor=teo workqueue.power_efficient=1"
 # end of Kernel Features
 
 #
@@ -592,7 +592,7 @@ CONFIG_PM_SLEEP=y
 CONFIG_PM_SLEEP_SMP=y
 CONFIG_PM_AUTOSLEEP=y
 CONFIG_POWERSUSPEND=y
-CONFIG_PM_ADVANCED_DEBUG=y
+# CONFIG_PM_ADVANCED_DEBUG is not set
 CONFIG_PM_WAKELOCKS=y
 CONFIG_PM_WAKELOCKS_LIMIT=50
 CONFIG_BOEFFLA_WL_BLOCKER=y
@@ -600,8 +600,8 @@ CONFIG_PM_WAKELOCKS_GC=y
 # CONFIG_WLAN_WAKEUP is not set
 # CONFIG_BT_WAKEUP is not set
 CONFIG_PM=y
-CONFIG_PM_DEBUG=y
-CONFIG_PM_SLEEP_DEBUG=y
+# CONFIG_PM_DEBUG is not set
+# CONFIG_PM_SLEEP_DEBUG is not set
 CONFIG_SUSPEND_STATS=y
 CONFIG_PM_CLK=y
 CONFIG_PM_GENERIC_DOMAINS=y
