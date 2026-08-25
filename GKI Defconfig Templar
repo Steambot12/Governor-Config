@@ -528,7 +528,7 @@ CONFIG_CC_HAVE_STACKPROTECTOR_SYSREG=y
 #
 # Boot options
 #
-CONFIG_CMDLINE="stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=none cgroup.memory=nokmem noirqdebug loglevel=3 thermal.off=0 rcu_nocbs=7 rcupdate.rcu_idle_gp_delay=3 nohz=on timer_migration=1 transparent_hugepage=madvise cpuidle.off=0 workqueue.power_efficient=1"
+CONFIG_CMDLINE="stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=none cgroup.memory=nokmem noirqdebug loglevel=3 thermal.off=0 rcupdate.rcu_idle_gp_delay=3 nohz=on timer_migration=1 transparent_hugepage=madvise cpuidle.off=0 workqueue.power_efficient=1"
 # CONFIG_CMDLINE_FROM_BOOTLOADER is not set
 CONFIG_CMDLINE_EXTEND=y
 # CONFIG_CMDLINE_FORCE is not set
