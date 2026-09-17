@@ -467,7 +467,7 @@ CONFIG_CC_HAVE_STACKPROTECTOR_SYSREG=y
 # CONFIG_STACKPROTECTOR_PER_TASK is not set
 # end of Kernel Features
 # Boot options
-CONFIG_CMDLINE="kasan=off stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=none noirqdebug loglevel=3 nohz=on mem_sleep_default=shallow transparent_hugepage=always workqueue.power_efficient=1 cpuidle.governor=nap"
+CONFIG_CMDLINE="kasan=off stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=none noirqdebug loglevel=3 nohz=on mem_sleep_default=shallow transparent_hugepage=always workqueue.power_efficient=1 cpuidle.governor=nap vm.swappiness=60 vm.min_free_kbytes=32768 zram.writeback=1 vm.overcommit_memory=1"
 # CONFIG_CMDLINE_FROM_BOOTLOADER is not set
 CONFIG_CMDLINE_EXTEND=y
 # CONFIG_CMDLINE_FORCE is not set
@@ -835,7 +835,7 @@ CONFIG_SPARSEMEM=y
 CONFIG_SPARSEMEM_EXTREME=y
 CONFIG_SPARSEMEM_VMEMMAP_ENABLE=y
 CONFIG_SPARSEMEM_VMEMMAP=y
-CONFIG_ANON_MIN_RATIO=5
+CONFIG_ANON_MIN_RATIO=3
 CONFIG_CLEAN_LOW_RATIO=5
 CONFIG_CLEAN_MIN_RATIO=0
 CONFIG_HAVE_FAST_GUP=y
@@ -857,11 +857,11 @@ CONFIG_MMU_NOTIFIER=y
 # CONFIG_KSM is not set
 CONFIG_DEFAULT_MMAP_MIN_ADDR=32768
 CONFIG_ARCH_SUPPORTS_MEMORY_FAILURE=y
-# CONFIG_MEMORY_FAILURE is not set
+CONFIG_MEMORY_FAILURE=y
 CONFIG_TRANSPARENT_HUGEPAGE=y
 CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS=y
 CONFIG_CLEANCACHE=y
-# CONFIG_FRONTSWAP is not set
+CONFIG_FRONTSWAP=y
 CONFIG_CMA=y
 # CONFIG_CMA_DEBUG is not set
 CONFIG_CMA_DEBUGFS=y
