@@ -467,7 +467,7 @@ CONFIG_CC_HAVE_STACKPROTECTOR_SYSREG=y
 # CONFIG_STACKPROTECTOR_PER_TASK is not set
 # end of Kernel Features
 # Boot options
-CONFIG_CMDLINE="kasan=off stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=none noirqdebug loglevel=3 nohz=on mem_sleep_default=shallow transparent_hugepage=always workqueue.power_efficient=1 cpuidle.governor=nap vm.swappiness=60 vm.min_free_kbytes=32768 zram.writeback=1 vm.overcommit_memory=1"
+CONFIG_CMDLINE="kasan=off stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=none noirqdebug loglevel=3 nohz=on mem_sleep_default=shallow transparent_hugepage=always workqueue.power_efficient=1 cpuidle.governor=nap vm.swappiness=20 vm.min_free_kbytes=65536 vm.vfs_cache_pressure=200 vm.watermark_scale=500 zram.writeback=1 zram.max_comp_streams=4 kernel.panic_on_oom=0"
 # CONFIG_CMDLINE_FROM_BOOTLOADER is not set
 CONFIG_CMDLINE_EXTEND=y
 # CONFIG_CMDLINE_FORCE is not set
