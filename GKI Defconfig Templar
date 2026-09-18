@@ -1,6 +1,6 @@
 #
 # Automatically generated file; DO NOT EDIT.
-# Linux/arm64 5.10.266 Kernel Configuration
+# Linux/arm64 5.10.270 Kernel Configuration
 # Release
 CONFIG_CC_VERSION_TEXT="XClang (+Polly) clang version 22.1.2 (https://github.com/llvm/llvm-project.git 1ab49a973e210e97d61e5db6557180dcb92c3e98)"
 CONFIG_GCC_VERSION=0
@@ -467,7 +467,7 @@ CONFIG_CC_HAVE_STACKPROTECTOR_SYSREG=y
 # CONFIG_STACKPROTECTOR_PER_TASK is not set
 # end of Kernel Features
 # Boot options
-CONFIG_CMDLINE="kasan=off stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=none noirqdebug loglevel=3 nohz=on mem_sleep_default=shallow transparent_hugepage=always cgroup_enable=memory workqueue.power_efficient=1 cpuidle.governor=nap vm.swappiness=5 vm.watermark_scale=1000 vm.dirty_ratio=10 vm.dirty_background_ratio=2 vm.dirty_expire_centisecs=500 zram.writeback=1 zram.max_comp_streams=4 kernel.sched_auto_move_group=1 kernel.panic_on_oom=0"
+CONFIG_CMDLINE="kasan=off stack_depot_disable=on kasan.stacktrace=off kvm-arm.mode=none noirqdebug loglevel=3 nohz=on mem_sleep_default=shallow transparent_hugepage=always cgroup_enable=memory workqueue.power_efficient=1 cpuidle.governor=nap vm.swappiness=5 watermark_scale_factor=1000 vm.dirty_ratio=10 vm.dirty_background_ratio=2 vm.dirty_expire_centisecs=500 kernel.panic_on_oom=0"
 # CONFIG_CMDLINE_FROM_BOOTLOADER is not set
 CONFIG_CMDLINE_EXTEND=y
 # CONFIG_CMDLINE_FORCE is not set
@@ -5866,7 +5866,7 @@ CONFIG_TRACE_CLOCK=y
 CONFIG_RING_BUFFER=y
 CONFIG_EVENT_TRACING=y
 CONFIG_CONTEXT_SWITCH_TRACER=y
-# CONFIG_TRACE_MMIO_ACCESS is not set
+CONFIG_TRACE_MMIO_ACCESS=y
 CONFIG_TRACEFS_DISABLE_AUTOMOUNT=y
 CONFIG_TRACING=y
 CONFIG_TRACING_SUPPORT=y
